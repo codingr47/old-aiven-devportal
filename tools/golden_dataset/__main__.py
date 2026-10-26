@@ -25,7 +25,7 @@ def main(argv=None):
         cmd = subs.add_parser(name)
         cmd.add_argument("--env-file", default=".env", help="Environment file (default: .env); environment variables override file values")
         cmd.add_argument("--max-sections", type=int, help="Target sections per invocation; overrides GOLDEN_MAX_SECTIONS")
-        cmd.add_argument("--retry-gaps", action="store_true", help="Explicitly retry exhausted sections for three more attempts")
+        cmd.add_argument("--retry-gaps", action="store_true", help="Reopen pages without an accepted question, with three fresh draft attempts per section")
         if name == 'generate':
             cmd.add_argument('--build-dir', help='Existing documentation build (default: _build from make livehtml)')
             cmd.add_argument('--page', action='append', help='Limit a new run to selected relative HTML pages')
@@ -76,8 +76,8 @@ def main(argv=None):
             output = run(store, config, args.max_sections, args.retry_gaps)
         elif args.command == "status":
             state = store.load()
-            if state.get('schema_version') != '3.0':
-                raise ValueError('Legacy checkpoint: create a new browser inventory for schema 3.0.')
+            if state.get('schema_version') != '3.1':
+                raise ValueError('Legacy checkpoint: create a new browser inventory for schema 3.1.')
             output = report(state)
             try:
                 verify_snapshot(state)

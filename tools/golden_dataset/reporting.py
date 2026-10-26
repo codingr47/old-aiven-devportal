@@ -100,39 +100,53 @@ def audit_result(state):
             "expanded_categories": sorted(categories)}
 
 
+def section_read(section):
+    return section.get('observed', False) and all(u["read"] for u in section["units"])
+
+
+def page_read(state, page):
+    # Sections whose headings never rendered are reported separately; they cannot block a crawl.
+    info = state['pages'][page]
+    return (info['visited'] and not info.get('pending_error') and
+            all(section_read(state['sections'][sid]) for sid in info['sections'] if state['sections'][sid]['observed']) and
+            all(c['visited'] and c['observation_consumed'] for c in info['controls'].values()))
+
+
+def browsing_complete(state):
+    return (not state['inventory_errors'] and not state['runtime'].get('error') and
+            all(page_read(state, page) for page in state['expected_pages']))
+
+
 def report(state):
     mandatory = set(state['expected_pages'])
     sections = [s for s in state["sections"].values() if s['page'] in mandatory]
-    substantive = [s for s in sections if s["substantive"]]
     covered = covered_sections(state)
-    read = lambda s: s.get('observed', False) and all(u["read"] for u in s["units"])
-    def page_read(p):
-        return (p['visited'] and not p.get('pending_error') and
-                all(read(state['sections'][sid]) for sid in p['sections']) and
-                all(c['visited'] and c['observation_consumed'] for c in p['controls'].values()))
-    pages_read = sum(page_read(p) for ident, p in state["pages"].items() if ident in mandatory)
+    substantive_pages = sorted({s['page'] for s in sections if s['substantive']})
+    covered_pages = {state['sections'][sid]['page'] for sid in covered}
     records = accepted(state)
     integrity = sum(not validate(c, state, check_duplicates=False) for c in records)
     candidates = state["candidates"]
     auto_passed = sum(c["status"] == "accepted" for c in candidates)
     duplicate = sum("duplicate_question" in c.get("validation", {}).get("deterministic_errors", []) for c in candidates)
-    gaps = [{"section_id": s["id"], "attempts": s["attempts"], "error": s["error"]}
-            for s in substantive if s["id"] not in covered]
-    runtime_error = state["runtime"].get("error")
-    browsing_complete = (pages_read == len(state["expected_pages"]) and not state["inventory_errors"] and
-                         not runtime_error and all(read(s) for s in sections))
+    # Questions are drafted where a reader would ask them; pages without one are reported, not forced.
+    gaps = [{"page": page, "attempts": sum(state['sections'][sid]['attempts'] for sid in state['pages'][page]['sections']),
+             "visited": state['pages'][page]['visited']} for page in substantive_pages if page not in covered_pages]
+    complete = browsing_complete(state)
     audit = audit_result(state)
-    ready = browsing_complete and bool(records) and not gaps and integrity == len(records) and audit["passed"]
-    return {"snapshot_id": state["snapshot_id"], "browsing_complete": browsing_complete, "ready": ready,
+    ready = complete and bool(records) and integrity == len(records) and audit["passed"]
+    return {"snapshot_id": state["snapshot_id"], "browsing_complete": complete, "ready": ready,
             "runtime": state["runtime"], "inventory_errors": state["inventory_errors"],
             "coverage_audit": state['coverage_audit'],
             "unresolved_controls": {p: c['controls'] for p, c in state['pages'].items() if p in mandatory and
                                     any(not v['visited'] or not v['observation_consumed'] for v in c['controls'].values())},
             "search_failures": state['browser']['search_failures'],
-            "page_coverage": ratio(pages_read, len(state["expected_pages"])),
-            "section_reading_coverage": ratio(sum(read(s) for s in sections), len(sections)),
-            "reading_unit_coverage": ratio(sum(u["read"] for s in sections for u in s["units"]), sum(len(s["units"]) for s in sections)),
-            "question_coverage": ratio(sum(s["id"] in covered for s in substantive), len(substantive)),
+            "broken_links": state['browser'].get('broken_links', []),
+            "page_coverage": ratio(sum(page_read(state, p) for p in mandatory), len(mandatory)),
+            "section_reading_coverage": ratio(sum(section_read(s) for s in sections), len(sections)),
+            "unobserved_sections": [s['id'] for s in sections if state['pages'][s['page']]['visited'] and not s['observed']],
+            "question_coverage": ratio(len(covered_pages & set(substantive_pages)), len(substantive_pages)),
+            "section_question_coverage": ratio(sum(s["id"] in covered for s in sections if s['substantive']),
+                                               sum(s['substantive'] for s in sections)),
             "evidence_integrity": ratio(integrity, len(records)),
             "automated_acceptance_rate": ratio(auto_passed, len(candidates)),
             "duplicate_rate": ratio(duplicate, len(candidates)), "audit": audit,
@@ -173,7 +187,9 @@ def export(state, destination, ready_only=False):
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     import copy
     public_metrics = copy.deepcopy(metrics)
-    for item in public_metrics["gaps"] + public_metrics["exclusions"]:
+    for item in public_metrics["gaps"]:
+        item["document_path"] = state["pages"][item.pop("page")]["source_path"]
+    for item in public_metrics["exclusions"]:
         item["section_id"] = public_section_id(state, item["section_id"])
     write("coverage.json", public_metrics)
     write("manifest.json", {"schema_version": state["schema_version"], "snapshot_id": state["snapshot_id"],

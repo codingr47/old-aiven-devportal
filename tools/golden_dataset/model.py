@@ -167,6 +167,7 @@ class Client:
             self.state["api_calls"].append(call)
             self.checkpoint()
             started = time.monotonic()
+            choice = None
             try:
                 request = Request(self.config["base_url"].rstrip("/") + "/chat/completions", data=body, headers=headers)
                 with traced('api', f'Waiting for {role} model (attempt {attempt + 1}; timeout={self.config.get("timeout_seconds", 120)}s)'):
@@ -180,6 +181,7 @@ class Client:
                                 usage_estimated=False)
                 choice = data["choices"][0]
                 call["status"] = "received"
+                call["finish_reason"] = choice.get("finish_reason")
                 self.checkpoint()
                 if choice.get("finish_reason") not in (None, "stop"):
                     raise InvalidOutput("Model output was truncated or refused")
@@ -196,8 +198,12 @@ class Client:
                 call["status"], transient = "network_failure", True
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 call["status"] = "invalid_output"
+                # Model text only (never the request), so malformed replies can be diagnosed.
+                if isinstance(choice, dict) and isinstance(choice.get("message"), dict):
+                    call["output_preview"] = str(choice["message"].get("content"))[:500]
                 self.checkpoint()
-                raise InvalidOutput("Invalid API response or model JSON") from None
+                raise InvalidOutput("Model output was truncated" if call.get("finish_reason") == "length"
+                                    else "Invalid API response or model JSON") from None
             self.checkpoint()
             trace('api', f"{role} failed: {call['status']}")
             if not transient or attempt == self.config.get("retries", 3) - 1:

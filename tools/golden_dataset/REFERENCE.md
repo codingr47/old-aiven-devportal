@@ -20,18 +20,39 @@ different existing build directory on the first run only.
 
 ## Actual browser behavior and coverage
 
-The generator's actions are `observe`, `click`, `type`, `keypress`, `scroll`,
-`back`, `navigate`, `draft_question`, and `finish`. Interaction uses current
-accessibility element references. There is no arbitrary JavaScript action,
-filesystem search, direct section reader, or source-file view available to it.
-Stale references refresh the observation so the model can replan.
+The agent browses like a reader. Its actions are `click`, `back`, `navigate`,
+`type`, `keypress` (Enter, Tab, Escape), `read_more`, `next_page`,
+`draft_questions`, and `finish`. Interaction uses current accessibility element
+references. There is no arbitrary JavaScript action, filesystem search, direct
+section reader, or source-file view available to it. Scrolling is not an action:
+the accessibility snapshot always covers the whole page. Stale references and
+blocked clicks return a fresh view so the model can replan.
 
-`observe(scope="page", cursor=N)` reads chunks of the accessibility representation
-including navigation. `observe(scope="main", cursor=N)` reads documentation
-content derived from the browser's accessible main region. Large observations
-have tracked chunks. A chunk counts as read only after a model response consumes
-it. Observations from the same content are reused across resume; browser handles
-and element references are always refreshed.
+Every action returns one view of the current page:
+
+- `content`: the whole article, section by section, with `observation_id`s to
+  quote. Articles over about 12,000 characters are split into stable
+  `content_parts`; `unread_parts` lists those not yet read (`read_more(part=N)`).
+  Sections read earlier in the session are stubbed as `already_read` while their
+  text is still in the generator's memory.
+- `nav`: the visible sidebar menu with depth, `visited` flags, and expanders for
+  collapsed groups. Expanding a group returns the menu with its new links.
+- `content_links`, `page_controls` (tabs and disclosures), and `site` (search box).
+- `progress` and `questions_on_page`, so the model knows what is left.
+
+Content counts as read once a model response has seen it. A section's progress
+follows its latest rendering, so switching a tab replaces rather than adds work.
+`next_page` follows the first unvisited in-scope article link, then menu link, then
+opens a collapsed menu group, and only then navigates to a discovered frontier URL.
+Memory carries roughly the last 16,000 characters read, which makes cross-page
+questions possible.
+
+Production pretty URLs (`docs/products/kafka`) are redirected to the built
+`.html` page, because the local preview only serves `.html` files. A link that
+still returns an HTTP error is recorded under `broken_links`, the browser goes
+back, and the model receives the error. Off-origin requests are blocked except
+rendering libraries (Mermaid from unpkg.com): the OneTrust consent banner would
+cover every page, and analytics would count the crawler as visits.
 
 The coverage audit privately inspects navigation/link destinations and source
 metadata, not article prose for generation. Its reachable pages are mandatory.
@@ -52,11 +73,16 @@ snippets are not evidence: it must open the documentation result. External pages
 and raw source views are outside browsing scope. Included source dependencies
 remain available to verification regardless of navigation reachability.
 
-Pages require all expected documentation sections and observed content chunks to
-be read, with discovered tabs/accordions visited and their content consumed.
-Hidden panel text cannot support a question before the browser reveals it.
-Unvisited routes, unread content states, or pending failures keep coverage
-incomplete. The model's `finish` request cannot override these checks.
+A page is read when it was visited, every rendered section's current text was
+delivered, and discovered tabs/disclosures were opened and their content consumed.
+Sections whose headings never render are listed as `unobserved_sections` instead
+of blocking the crawl. Hidden panel text cannot support a question before the
+browser reveals it. The model's `finish` request cannot override these checks.
+
+Questions are drafted where a reader would ask them: 0-3 per page, none for
+link-only hub pages. `question_coverage` is the share of substantive pages with an
+accepted question. `gaps` lists the pages without one; gaps are reported but do
+not block completion or release.
 
 `GOLDEN_MAX_SECTIONS` limits completed target-section work per invocation: an
 accepted question or three exhausted attempts finishes that work item. Blank is
@@ -79,11 +105,16 @@ hashes. Unmappable evidence fails; only a concise failure category goes back to
 the generator. The generator never receives verifier snippets or source mappings.
 The independent reviewer receives both browser evidence and verified raw source
 spans to assess support, completeness, ambiguity, realism, and evidence necessity.
-There are three draft attempts per section; `resume --retry-gaps` grants three
-more. Rejections remain inspectable. Pending independent reviews resume without
-regenerating the question.
+There are three draft attempts per section. `resume --retry-gaps` reopens pages
+without an accepted question (marking them unvisited and unread, with fresh
+attempts) so the crawl returns to them. Rejections remain inspectable. A
+malformed reviewer reply is retried once; the draft then stays pending and is
+revalidated on resume without regenerating the question. Truncated generator
+replies come back as `output_truncated` feedback asking for fewer, shorter
+questions. Three malformed replies in a row pause the run. Reasoning models need
+`GOLDEN_OUTPUT_TOKENS` well above 4096 to draft question batches.
 
-Schema **3.0** retains source-based evaluation identities:
+Schema **3.1** retains source-based evaluation identities:
 
 ```json
 {

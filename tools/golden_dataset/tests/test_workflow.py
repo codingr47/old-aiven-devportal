@@ -106,11 +106,18 @@ def raw_candidate(sid, observation_id, excerpt, question='How can I enable compa
                 {'observation_id': observation_id, 'excerpt': excerpt}]}], 'related_links': []}
 
 
+def control(view, label):
+    for item in view['nav'] + view['content_links'] + view['site'] + view['page_controls']:
+        if label in (item.get('label') or item.get('expand') or ''):
+            return item
+    raise AssertionError(label + ' is not in the view')
+
+
 class MockProvider:
     def __init__(self):
         self.calls, self.seen, self.asked = [], set(), set()
         self.fail_code = self.fail_review = None
-        self.bad_generation = self.force_finish = self.cross_page = False
+        self.bad_generation = self.bad_review = self.force_finish = self.cross_page = False
         self.navigation_policy = None
         owner = self
 
@@ -131,41 +138,43 @@ class MockProvider:
                     result = {'ok': True}
                 elif 'Independently assess' in task:
                     result = {'checks': {key: True for key in RUBRIC}, 'notes': 'Synthetic review: sources support the supplied claims.'}
+                    bad = owner.bad_review
                 else:
                     view = payload['browser']
-                    owner.seen.add(view['url'].split('#')[0])
+                    owner.seen.add(view['page'])
                     custom = owner.navigation_policy(view, payload) if owner.navigation_policy else None
+                    # A reader drafts questions for unread sentences on the page, then moves on.
+                    fresh = [c for c in view['content'] if 'text' in c and view['in_dataset_scope'] and
+                             re.search(r'[.!?]', c['text']) and c['section_id'] not in owner.asked]
                     if custom:
                         result = custom
                     elif owner.force_finish:
                         result = {'tool': 'finish'}
-                    elif view['scope'] == 'page':
-                        result = {'tool': 'observe', 'arguments': {'scope': 'main'}}
-                    elif view.get('question_required'):
-                        sid = view['section_id']
-                        excerpt = re.split(r'(?<=[.!?])\s', view['text'])[0]
-                        candidate = raw_candidate(sid, view['observation_id'], excerpt,
-                                                  'What should I do about ' + view['heading_path'][-1] + '?')
-                        other = next((m for m in payload.get('memory', []) if m['url'].split('#')[0] != view['url'].split('#')[0]), None)
-                        if owner.cross_page and other:
-                            extra = re.split(r'(?<=[.!?])\s', other['text'])[0]
-                            candidate['question_type'] = 'cross_page'
-                            candidate['reference_answer'] += ' ' + extra
-                            candidate['required_facts'].append(extra)
-                            candidate['evidence_groups'].append({'fact_indices': [1], 'alternatives': [
-                                {'observation_id': other['observation_id'], 'excerpt': extra}]})
-                        result = {'tool': 'draft_question', 'arguments': candidate}
-                        bad = owner.bad_generation
-                    elif view.get('remaining_chunks', 0) > 1:
-                        result = {'tool': 'observe', 'arguments': {'scope': 'main'}}
+                    elif fresh:
+                        questions = []
+                        for item in fresh[:3]:
+                            owner.asked.add(item['section_id'])
+                            excerpt = re.split(r'(?<=[.!?])\s', item['text'])[0]
+                            candidate = raw_candidate(item['section_id'], item['observation_id'], excerpt,
+                                                      'What should I do about ' + item['heading_path'][-1] + '?')
+                            del candidate['target_section']
+                            other = next((m for m in payload.get('memory', []) if m['page'] != view['page']), None)
+                            if owner.cross_page and other:
+                                extra = re.split(r'(?<=[.!?])\s', other['text'])[0]
+                                candidate['question_type'] = 'cross_page'
+                                candidate['reference_answer'] += ' ' + extra
+                                candidate['required_facts'].append(extra)
+                                candidate['evidence_groups'].append({'fact_indices': [1], 'alternatives': [
+                                    {'observation_id': other['observation_id'], 'excerpt': extra}]})
+                            questions.append(candidate)
+                        result = {'tool': 'draft_questions', 'arguments': {'questions': questions}}
+                    elif view.get('unread_parts'):
+                        result = {'tool': 'read_more', 'arguments': {'part': view['unread_parts'][0]}}
+                    elif str((payload.get('feedback') or {}).get('detail', '')).startswith('No unvisited'):
+                        result = {'tool': 'finish'}
                     else:
-                        link = next((c for c in view['controls'] if c.get('url', '').split('#')[0] not in owner.seen and 'url' in c), None)
-                        if link:
-                            result = {'tool': 'click', 'arguments': {'ref': link['ref']}}
-                        elif view.get('frontier'):
-                            result = {'tool': 'navigate', 'arguments': {'url': view['frontier'][0]['url']}}
-                        else:
-                            result = {'tool': 'finish'}
+                        result = {'tool': 'next_page', 'arguments': {}}
+                    bad = owner.bad_generation
                 data = json.dumps({'choices': [{'finish_reason': 'stop', 'message': {'content': '{broken' if bad else json.dumps(result)}}],
                                    'usage': {'prompt_tokens': 50, 'completion_tokens': 30}}).encode()
                 self.send_response(200)
@@ -251,7 +260,7 @@ class WorkflowTests(unittest.TestCase):
         return candidate
 
     def test_inventory_is_metadata_only_and_excludes_orphans(self):
-        self.assertEqual(self.state['schema_version'], '3.0')
+        self.assertEqual(self.state['schema_version'], '3.1')
         self.assertEqual(self.state['expected_pages'], ['docs/other.html', 'index.html'])
         self.assertEqual(self.state['coverage_audit']['excluded'], ['docs/orphan.html'])
         self.assertNotIn('SOURCE_ONLY_CANARY', json.dumps(self.state))
@@ -265,20 +274,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('docs/orphan.html', self.state['coverage_audit']['orphans'])
         with Browser(self.state, self.provider.config, lambda: None) as browser:
             view = browser.observe()
-            link = next(c for c in view['controls'] if c['name'] == 'Unlinked guide')
-            browser.tool('click', {'ref': link['ref']})
+            browser.tool('click', {'ref': control(view, 'Unlinked guide')['ref']})
             self.assertEqual(browser.page_id(), 'docs/orphan.html')
 
     def test_real_browser_navigation_controls_and_boundary(self):
         with Browser(self.state, self.provider.config, lambda: None) as browser:
-            view = browser.observe('page')
-            self.assertFalse(any(c['name'] == 'Limits' for c in view['controls']))
+            view = browser.observe()
+            browser.consume(view)
+            self.assertFalse(any(item.get('label') == 'Limits' for item in view['nav']))
             with self.assertRaisesRegex(ValueError, 'not been discovered'):
                 browser.tool('navigate', {'url': self.provider.config['docs_url'] + '/docs/orphan.html'})
-            menu = next(c for c in view['controls'] if c['name'] == 'Documentation')
-            browser.tool('click', {'ref': menu['ref']})
-            view = browser.observe('page')
-            limits = next(c for c in view['controls'] if c['name'] == 'Limits')
+            menu = control(view, 'Documentation')
+            self.assertFalse(menu['expanded'])
+            view = browser.tool('click', {'ref': menu['ref']})
+            # Expanding the menu returns the menu, with the article already read stubbed out.
+            self.assertTrue(control(view, 'Documentation')['expanded'])
+            self.assertTrue(all(c.get('already_read') for c in view['content']))
+            limits = control(view, 'Limits')
+            self.assertEqual((limits['page'], limits['visited']), ('docs/other.html', False))
             browser.tool('click', {'ref': limits['ref']})
             self.assertEqual(browser.page_id(), 'docs/other.html')
             browser.tool('back', {})
@@ -289,32 +302,30 @@ class WorkflowTests(unittest.TestCase):
 
     def test_real_search_typing_and_orphan_promotion(self):
         with Browser(self.state, self.provider.config, lambda: None) as browser:
-            view = browser.observe('page')
-            search = next(c for c in view['controls'] if c['name'] == 'Search')
-            view = browser.tool('click', {'ref': search['ref']})
-            query = next(c for c in view['controls'] if c['role'] == 'textbox')
+            view = browser.observe()
+            view = browser.tool('click', {'ref': control(view, 'Search')['ref']})
+            query = next(c for c in view['page_controls'] if c['role'] == 'textbox')
             view = browser.tool('type', {'ref': query['ref'], 'text': 'dedicated topic'})
-            button = next(c for c in view['controls'] if c['name'] == 'Find')
-            view = browser.tool('click', {'ref': button['ref']})
-            result = next(c for c in view['controls'] if c['name'] == 'Unlinked guide')
-            view = browser.tool('click', {'ref': result['ref']})
+            view = browser.tool('click', {'ref': control(view, 'Find')['ref']})
+            view = browser.tool('click', {'ref': control(view, 'Unlinked guide')['ref']})
             browser.consume(view)
             self.assertIn('docs/orphan.html', self.state['expected_pages'])
             self.assertIn('docs/orphan.html', self.state['coverage_audit']['promoted'])
-            browser.tool('keypress', {'key': 'PageDown'})
-            browser.tool('scroll', {'pixels': 200})
+            browser.tool('keypress', {'key': 'Escape'})
+            # Scrolling never changes an accessibility snapshot, so it is not an action.
+            for name, arguments in (('keypress', {'key': 'PageDown'}), ('scroll', {'pixels': 200})):
+                with self.assertRaises(ValueError):
+                    browser.tool(name, arguments)
 
     def test_search_request_failure_is_recorded_without_filesystem_fallback(self):
         (self.build / 'search.html').write_text(SEARCH.replace("document.getElementById('result').hidden=false", "fetch('/missing-search-api')"))
         with Browser(self.state, self.provider.config, lambda: None) as browser:
-            view = browser.observe('page')
-            search = next(c for c in view['controls'] if c['name'] == 'Search')
-            view = browser.tool('click', {'ref': search['ref']})
-            button = next(c for c in view['controls'] if c['name'] == 'Find')
-            browser.tool('click', {'ref': button['ref']})
+            view = browser.observe()
+            view = browser.tool('click', {'ref': control(view, 'Search')['ref']})
+            browser.tool('click', {'ref': control(view, 'Find')['ref']})
             browser.page.wait_for_timeout(100)
             self.assertTrue(self.state['browser']['search_failures'])
-            self.assertTrue(browser.observe('page')['search_status']['failed'])
+            self.assertTrue(browser.observe()['search_status']['failed'])
             with self.assertRaises(ValueError):
                 browser.tool('search_snapshot', {'query': 'secret'})
 
@@ -332,22 +343,23 @@ class WorkflowTests(unittest.TestCase):
             browser.consume(view)
             self.assertNotIn('Records require keys.', json.dumps(self.state['observations']))
             self.assertTrue(report(self.state)['unresolved_controls'])
-            tab = next(c for c in view['controls'] if c['name'] == 'Advanced')
-            view = browser.tool('click', {'ref': tab['ref']})
+            self.assertFalse(control(view, 'Details')['expanded'])
+            view = browser.tool('click', {'ref': control(view, 'Advanced')['ref']})
             self.assertIn('Records require keys.', json.dumps(self.state['observations']))
-            detail = next(c for c in view['controls'] if c['name'] == 'Details')
-            browser.tool('click', {'ref': detail['ref']})
+            # Only the section whose text changed is delivered again.
+            self.assertIn('Records require keys.', json.dumps(view['content']))
+            browser.tool('click', {'ref': control(view, 'Details')['ref']})
             self.assertIn('Retention can delay deletion.', json.dumps(self.state['observations']))
             self.assertFalse(report(self.state)['browsing_complete'])
 
     def test_stale_reference_refreshes_observation_and_disallows_arbitrary_code(self):
         with Browser(self.state, self.provider.config, lambda: None) as browser:
             view = browser.observe()
-            link = next(c for c in view['controls'] if c['name'] == 'Other page')
+            link = control(view, 'Other page')
             browser.page.get_by_role('link', name='Other page').evaluate('(element) => element.remove()')
             fresh = browser.tool('click', {'ref': link['ref']})
             self.assertIn('action_error', fresh)
-            self.assertEqual(fresh['scope'], 'page')
+            self.assertEqual(fresh['page'], 'index.html')
             with self.assertRaises(ValueError):
                 browser.tool('evaluate', {'code': 'document.body.innerText'})
 
@@ -359,12 +371,72 @@ class WorkflowTests(unittest.TestCase):
         (self.build / 'index.html').write_text(html)
         self.reset_inventory()
         with Browser(self.state, self.provider.config, lambda: None) as browser:
-            view = browser.observe('page')
-            self.assertTrue(any(c['role'] == 'generic' and 'Documentation' in c['name'] for c in view['controls']), view['snapshot'])
-            toggle = next(c for c in view['controls'] if c['role'] == 'generic' and 'Documentation' in c['name'])
-            browser.tool('click', {'ref': toggle['ref']})
-            view = browser.observe('page')
-            self.assertTrue(any(c['name'] == 'Limits' for c in view['controls']))
+            view = browser.observe()
+            toggle = control(view, 'Documentation')
+            self.assertIn('expand', toggle)
+            view = browser.tool('click', {'ref': toggle['ref']})
+            self.assertEqual(control(view, 'Limits')['page'], 'docs/other.html')
+
+    def test_pretty_url_links_resolve_to_built_pages(self):
+        # The production site links docs/other; the local preview only serves docs/other.html.
+        (self.build / 'index.html').write_text(PAGE.replace('<a href="docs/other.html">Other page</a>', '<a href="docs/other">Other page</a>'))
+        self.reset_inventory()
+        with Browser(self.state, self.provider.config, lambda: None) as browser:
+            view = browser.observe()
+            link = control(view, 'Other page')
+            self.assertEqual(link['page'], 'docs/other.html')
+            view = browser.tool('click', {'ref': link['ref']})
+            self.assertNotIn('action_error', view)
+            self.assertTrue(browser.page.url.endswith('/docs/other.html'))
+            self.assertIn(self.provider.config['docs_url'] + '/docs/other.html', self.state['browser']['discovered'])
+
+    def test_broken_link_is_reported_and_browsing_continues(self):
+        (self.build / 'docs/orphan.html').unlink()
+        with Browser(self.state, self.provider.config, lambda: None) as browser:
+            browser.page.evaluate("document.querySelector('main').insertAdjacentHTML('beforeend', '<a href=\"docs/orphan.html\">Gone</a>')")
+            view = browser.observe()
+            view = browser.tool('click', {'ref': control(view, 'Gone')['ref']})
+            self.assertIn('HTTP 404', view['action_error'])
+            self.assertEqual(view['page'], 'index.html')
+            self.assertEqual(self.state['browser']['broken_links'][0]['url'], self.provider.config['docs_url'] + '/docs/orphan.html')
+            self.assertEqual(browser.tool('observe', {})['page'], 'index.html')
+
+    def test_observation_survives_a_document_swap(self):
+        with Browser(self.state, self.provider.config, lambda: None) as browser:
+            # Mimic a navigation committing: the body disappears briefly, then returns.
+            browser.page.evaluate("""() => { const body = document.body; body.remove();
+                setTimeout(() => document.documentElement.appendChild(body), 300); }""")
+            view = browser.observe()
+            self.assertEqual(view['content'][0]['section_id'], 'index.html#start')
+
+    def test_third_party_consent_and_analytics_requests_are_blocked(self):
+        with Browser(self.state, self.provider.config, lambda: None) as browser:
+            loaded = browser.page.evaluate("fetch('https://cdn.cookielaw.org/x.js').then(() => true, () => false)")
+            self.assertFalse(loaded)
+            self.assertTrue(browser.page.evaluate("fetch('index.html').then(r => r.ok)"))
+
+    def test_whole_article_in_one_view_without_reread_loops(self):
+        with Browser(self.state, self.provider.config, lambda: None) as browser:
+            view = browser.observe()
+            self.assertEqual([c['section_id'] for c in view['content']],
+                             ['index.html#start', 'index.html#compact', 'index.html#navigation'])
+            self.assertTrue(all('text' in c for c in view['content']))
+            browser.consume(view)
+            again = browser.observe()
+            self.assertTrue(all(c.get('already_read') and 'text' not in c for c in again['content']))
+            self.assertEqual(again['unread_parts'], [])
+            self.assertEqual({m['observation_id'] for m in browser.memory()}, {c['observation_id'] for c in view['content']})
+
+    def test_next_page_follows_article_links_before_frontier(self):
+        with Browser(self.state, self.provider.config, lambda: None) as browser:
+            view = browser.observe()
+            browser.consume(view)
+            view = browser.next_page()
+            self.assertEqual(view['page'], 'docs/other.html')
+            self.assertEqual(view['progress']['pages_visited'], 2)
+            browser.consume(view)
+            with self.assertRaisesRegex(ValueError, 'No unvisited'):
+                browser.next_page()
 
     def test_only_consumed_browser_observations_count_as_read(self):
         with Browser(self.state, self.provider.config, lambda: None) as browser:
@@ -379,8 +451,8 @@ class WorkflowTests(unittest.TestCase):
         self.reset_inventory()
         with Browser(self.state, self.provider.config, lambda: None) as browser:
             view = browser.observe()
-            self.assertTrue(view['text'].startswith('The cleaner is enabled by default.'))
-            self.assertNotIn('Toggle table of contents sidebar', view['text'])
+            self.assertTrue(view['content'][0]['text'].startswith('The cleaner is enabled by default.'))
+            self.assertNotIn('Toggle table of contents sidebar', json.dumps(view['content']))
 
     def test_long_observations_are_not_silently_truncated(self):
         text = 'Long documentation content. ' * 500
@@ -390,24 +462,22 @@ class WorkflowTests(unittest.TestCase):
         self.reset_inventory(['index.html'])
         with Browser(self.state, self.provider.config, lambda: None) as browser:
             view = browser.observe()
-            self.assertGreater(view['chunks'], 1)
-            self.assertLessEqual(len(view['text']), UNIT_CHARS)
-            self.assertEqual(view['cursor'], 0)
-            self.assertEqual(view['next_unread_cursor'], 1)
+            self.assertEqual((view['content_part'], view['content_parts'], view['unread_parts']), (0, 2, [1]))
+            self.assertTrue(all(len(c['text']) <= UNIT_CHARS for c in view['content']))
+            delivered = ''.join(c['text'] for c in view['content'])
             browser.consume(view)
-            second = browser.tool('observe', {'scope': 'main', 'cursor': view['next_unread_cursor']})
-            self.assertNotEqual(second['chunk_id'], view['chunk_id'])
-            self.assertEqual(second['cursor'], 1)
-            browser.consume(second)
             self.assertFalse(report(self.state)['browsing_complete'])
-            for _ in range(view['chunks']):
-                view = browser.observe()
-                browser.consume(view)
+            second = browser.tool('read_more', {'part': 1})
+            self.assertEqual((second['content_part'], second['unread_parts']), (1, []))
+            self.assertEqual(delivered + ''.join(c['text'] for c in second['content']),
+                             self.state['sections']['index.html#start']['text'])
+            browser.consume(second)
             self.assertTrue(report(self.state)['browsing_complete'])
+            # Part numbers are stable: rereading part 0 shows it as already read.
+            self.assertTrue(browser.tool('read_more', {'part': 0})['content'][0]['already_read'])
 
     def test_repeated_observation_loop_pauses_without_claiming_completion(self):
-        self.provider.navigation_policy = lambda view, payload: {
-            'tool': 'observe', 'arguments': {'scope': 'main', 'cursor': 0}}
+        self.provider.navigation_policy = lambda view, payload: {'tool': 'observe', 'arguments': {}}
         result = run(self.store, self.provider.config)
         self.assertEqual(result['runtime']['status'], 'paused')
         self.assertIn('repeated the same action', result['runtime']['error'])
@@ -471,7 +541,7 @@ class WorkflowTests(unittest.TestCase):
     def test_complete_real_browser_workflow_resume_audit_export(self):
         partial = run(self.store, self.provider.config, max_sections=1)
         self.assertEqual(partial['runtime']['status'], 'paused')
-        self.assertEqual(partial['accepted'], 1)
+        self.assertGreaterEqual(partial['accepted'], 1)
         result = run(self.store, self.provider.config)
         self.assertTrue(result['browsing_complete'], result)
         self.assertEqual(result['question_coverage']['rate'], 1)
@@ -486,7 +556,10 @@ class WorkflowTests(unittest.TestCase):
         result = export(state, self.root / 'export', ready_only=True)
         self.assertTrue(result['ready'])
         manifest = json.loads((self.root / 'export/manifest.json').read_text())
-        self.assertEqual(manifest['schema_version'], '3.0')
+        self.assertEqual(manifest['schema_version'], '3.1')
+        journey = [json.loads(line) for line in (self.root / 'export/journey.jsonl').read_text().splitlines()]
+        self.assertIn('next_page', {step['tool'] for step in journey})
+        self.assertIn('draft_questions', {step['tool'] for step in journey})
         records = [json.loads(line) for line in (self.root / 'export/questions.jsonl').read_text().splitlines()]
         self.assertEqual(len(records), len({c['id'] for c in records}))
         for c in records:
@@ -531,18 +604,56 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(result['browsing_complete'], result)
         self.assertEqual(len(self.store.load()['candidates']), result['accepted'])
 
-    def test_bad_generation_three_attempts_and_explicit_retry(self):
+    def test_malformed_generation_pauses_without_burning_attempts(self):
         self.provider.bad_generation = True
         result = run(self.store, self.provider.config)
-        self.assertTrue(result['browsing_complete'], result)
-        self.assertTrue(all(g['attempts'] == 3 for g in result['gaps']))
+        self.assertEqual(result['runtime']['status'], 'paused')
+        self.assertIn('malformed', result['runtime']['error'])
+        self.assertEqual(result['candidates'], 0)
+        self.assertTrue(all(s['attempts'] == 0 for s in self.store.load()['sections'].values()))
+        requests = [json.loads(call['messages'][1]['content']) for call in self.provider.calls]
+        browsing = [payload for payload in requests if 'browser' in payload]
+        self.assertEqual(len(browsing), 3)
+        self.assertEqual(browsing[1]['feedback']['error_category'], 'malformed_action')
         self.provider.bad_generation = False
-        result = run(self.store, self.provider.config, retry_gaps=True)
+        self.provider.asked.clear()
+        result = run(self.store, self.provider.config)
+        self.assertTrue(result['browsing_complete'], result)
         self.assertEqual(result['question_coverage']['rate'], 1)
+
+    def test_malformed_reviews_never_pause_and_are_revalidated(self):
+        self.provider.bad_review = True
+        result = run(self.store, self.provider.config)
+        self.assertEqual(result['runtime']['status'], 'browsed', result['runtime'])
+        self.assertTrue(result['browsing_complete'])
+        self.assertEqual(result['accepted'], 0)
+        pending = [c for c in self.store.load()['candidates'] if c['status'] == 'pending_revalidation']
+        self.assertTrue(pending)
+        # Still malformed: the startup review keeps them pending instead of pausing.
+        self.assertEqual(run(self.store, self.provider.config)['runtime']['status'], 'browsed')
+        self.provider.bad_review = False
+        generator_calls = sum(call['model'] == 'generator' for call in self.provider.calls)
+        result = run(self.store, self.provider.config)
+        self.assertEqual(result['accepted'], len(pending))
+        self.assertEqual(sum(call['model'] == 'generator' for call in self.provider.calls), generator_calls)
+
+    def test_retry_gaps_reopens_pages_without_questions(self):
+        self.provider.navigation_policy = lambda view, payload: (
+            {'tool': 'next_page'} if view['page'] == 'docs/other.html' and any('text' in c for c in view['content']) else None)
+        result = run(self.store, self.provider.config)
+        self.assertTrue(result['browsing_complete'], result)
+        self.assertEqual([g['page'] for g in result['gaps']], ['docs/other.html'])
+        self.provider.navigation_policy = None
+        self.provider.asked.clear()
+        result = run(self.store, self.provider.config, retry_gaps=True)
+        self.assertTrue(result['browsing_complete'], result)
+        self.assertEqual(result['gaps'], [])
 
     def test_config_section_limit_and_cli_override(self):
         config = {**self.provider.config, 'max_sections': 1}
-        self.assertEqual(run(self.store, config)['accepted'], 1)
+        result = run(self.store, config)
+        self.assertEqual(result['runtime']['status'], 'paused')
+        self.assertGreaterEqual(result['accepted'], 1)
         result = run(self.store, config, max_sections=10)
         self.assertTrue(result['browsing_complete'], result)
 
@@ -597,11 +708,11 @@ class WorkflowTests(unittest.TestCase):
         (self.build / 'index.html').write_text(PAGE.replace('</nav>', '<a href="docs/tls.html">TLS guide</a></nav>'))
         self.reset_inventory(['docs/tls.html'])
         with Browser(self.state, self.provider.config, lambda: None) as browser:
-            view = browser.observe('page')
-            link = next(c for c in view['controls'] if c['name'] == 'TLS guide')
-            view = browser.tool('click', {'ref': link['ref']})
+            view = browser.observe()
+            view = browser.tool('click', {'ref': control(view, 'TLS guide')['ref']})
             browser.consume(view)
-            c = create_candidate(raw_candidate(view['section_id'], view['observation_id'], view['text']), self.state, view['section_id'], self.provider.config)
+            item = view['content'][0]
+            c = create_candidate(raw_candidate(item['section_id'], item['observation_id'], item['text']), self.state, item['section_id'], self.provider.config)
             self.state['candidates'].append(c)
             self.assertTrue(review_candidate(c, self.state, Client(self.provider.config, self.state, lambda: None)))
             span = c['evidence_groups'][0]['alternatives'][0]['source_spans'][0]
@@ -654,8 +765,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_quote_from_unconsumed_observation_is_rejected(self):
         with Browser(self.state, self.provider.config, lambda: None) as browser:
-            view = browser.observe()
-            c = create_candidate(raw_candidate(view['section_id'], view['observation_id'], view['text']), self.state, view['section_id'], self.provider.config)
+            item = browser.observe()['content'][0]
+            c = create_candidate(raw_candidate(item['section_id'], item['observation_id'], item['text']), self.state, item['section_id'], self.provider.config)
             self.assertFalse(review_candidate(c, self.state, Client(self.provider.config, self.state, lambda: None)))
 
     def test_app_build_mismatch_and_snapshot_drift(self):
@@ -704,7 +815,7 @@ class WorkflowTests(unittest.TestCase):
             config.api_key = 'synthetic-local-key'
             with Browser(self.state, config, lambda: None) as browser:
                 view = browser.observe()
-                self.assertTrue(view['text'].startswith('The cleaner is enabled by default.'))
+                self.assertTrue(view['content'][0]['text'].startswith('The cleaner is enabled by default.'))
             self.assertTrue(run(self.store, config)['browsing_complete'])
         finally:
             process.terminate()

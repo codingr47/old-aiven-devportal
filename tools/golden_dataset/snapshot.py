@@ -138,17 +138,17 @@ def inventory(repo, build_dir, selection=None, build=True):
     snapshot_metadata = {"commit": commit(repo), "source_hashes": before, "rendered_hashes": rendered,
                 "build_command": command, "selection": selection, "normalization": "whitespace-v1",
                 "unit_chars": UNIT_CHARS, "build_fresh": build, "source_mapping": "browser-evidence-v1"}
-    return {"schema_version": "3.0", "execution_mode": "browser_accessibility", "snapshot_id": digest(snapshot_metadata), "snapshot": snapshot_metadata,
+    return {"schema_version": "3.1", "execution_mode": "browser_accessibility", "snapshot_id": digest(snapshot_metadata), "snapshot": snapshot_metadata,
             "created_at": now(), "repo": str(repo), "build_dir": str(build_dir),
             "expected_pages": sorted(mandatory), "coverage_audit": audit, "observations": {},
-            "browser": {"last_url": None, "discovered": {}, "search_failures": []}, "navigation": navigation, "pages": pages, "sections": sections,
+            "browser": {"last_url": None, "discovered": {}, "search_failures": [], "broken_links": [], "recent_observations": []}, "navigation": navigation, "pages": pages, "sections": sections,
             "inventory_errors": errors, "candidates": [], "journey": [], "api_calls": [],
             "audit": None, "runtime": {"status": "inventoried", "error": None}}
 
 
 def verify_snapshot(state):
-    if state.get("schema_version") != "3.0":
-        raise ValueError("Legacy checkpoint: create a new browser inventory for schema 3.0.")
+    if state.get("schema_version") != "3.1":
+        raise ValueError("Legacy checkpoint: create a new browser inventory for schema 3.1.")
     repo, build_dir = Path(state["repo"]), Path(state["build_dir"])
     # Git HEAD is provenance, not content identity: committing tooling or README
     # changes must not invalidate an unchanged documentation/build snapshot.

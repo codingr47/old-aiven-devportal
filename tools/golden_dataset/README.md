@@ -65,7 +65,9 @@ per invocation. The agent can pause with exit code `2`; its progress is saved.
 The terminal prints timestamped startup, inventory, snapshot, browser, action,
 validation, and API traces to stderr. Long stages print a heartbeat every 15 seconds.
 Chromium opens before API checks and pending reviews, after the local inventory and
-snapshot checks pass. Reading accessibility text or
+snapshot checks pass. The agent moves like a reader: it follows article links,
+opens sidebar menu groups, and uses search, drafting up to three questions on pages
+worth asking about. Cookie banners and analytics are blocked. Reading a page or
 reviewing a draft can leave the visible page unchanged. Repeated identical actions
 trigger replanning feedback, then pause after six repetitions to avoid wasting requests.
 The final JSON result goes to stdout. To save a combined trace in PowerShell:
@@ -111,6 +113,7 @@ export with `--ready-only`.
 | `GOLDEN_DOCS_URL=http://localhost:8000` | Change only if your existing server uses another URL. |
 | `GOLDEN_HEADLESS=false` | Set true to hide the browser window. |
 | `GOLDEN_BROWSER_MAX_ACTIONS=200` | Actions per invocation before pausing; use `resume` to continue. |
+| `GOLDEN_OUTPUT_TOKENS=4096` | Raise to 8192+ for reasoning models; question batches get truncated otherwise. |
 
 The default checkpoint is `_build/golden-dataset/run.sqlite3`. Later `generate`
 calls reuse it, just like `resume`. Keep source documents and the build unchanged
@@ -131,7 +134,7 @@ venv/Scripts/python.exe -m tools.golden_dataset --db _build/custom-run.sqlite3 g
 ```
 
 Use that same `--db` for subsequent status, resume, review, and export commands.
-Old schema 1.0/2.0 checkpoints require a fresh run. If the build is missing, start
+Old schema 1.0/2.0/3.0 checkpoints require a fresh run. If the build is missing, start
 `make livehtml` and wait for its first build to finish.
 
 See [the reference](REFERENCE.md) for scope filters, browser behavior, evidence
