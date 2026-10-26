@@ -6,70 +6,252 @@ as a user. Question generation receives browser observations only. A separate
 post-draft verifier reads repository sources to attach precise `.rst`, `.md`,
 include, and code-file citations. This tool does not run RAG experiments.
 
-## Setup and existing local app
+## Run it step by step: Windows PowerShell
 
-Use Python 3.10+ in the documentation project's environment:
+These steps start with a small Kafka test, then explain how to run the full
+corpus. **Run every command from the repository root**, the folder containing
+`conf.py`, `requirements.txt`, and `tools/`. Python 3.11 is recommended.
+
+You will use three terminals:
+
+| Terminal | Purpose | Keep it running? |
+| --- | --- | --- |
+| 1 | Serves the documentation at `http://127.0.0.1:8000` | Yes, while generating/resuming |
+| 2 | Installs, inventories, generates, checks status, and exports | Commands return when finished or paused |
+| 3 | Serves the review interface at `http://127.0.0.1:8765` | Yes, while reviewing |
+
+The model API is a separate service supplied by your provider or local model
+server. The tool starts Chromium, but **does not start the model API or the
+documentation server**.
+
+### 1. Install dependencies — Terminal 2
+
+If the `venv` folder already exists, keep it. Otherwise create it with Python 3.11:
 
 ```powershell
-venv/Scripts/python.exe -m pip install -r tools/golden_dataset/requirements.txt
+if (-not (Test-Path venv/Scripts/python.exe)) { py -3.11 -m venv venv }
+venv/Scripts/python.exe -m pip install -r requirements.txt -r tools/golden_dataset/requirements.txt
 venv/Scripts/python.exe -m playwright install chromium
 ```
 
-Copy `.env.example` to the repository-root `.env` if there is no existing `.env`.
-Otherwise add its `GOLDEN_` settings to the existing file. Set the compatible API
-base URL, generator and reviewer model names, and optional API key. Neither native
-tool calling nor a vision model is required. `GOLDEN_PARAMETERS` accepts optional
-provider-specific Chat Completions parameters as a JSON object.
+No environment activation is necessary: all commands explicitly use the virtual
+environment's Python. Wait for the Chromium installation to finish before continuing.
 
-Configure the already running documentation app:
+### 2. Configure your model and manual-test limits — Terminal 2
+
+Create `.env` only if you do not already have one:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item tools/golden_dataset/.env.example .env }
+```
+
+Open `.env` in your editor. Set the following values, replacing the API URL,
+model names, and key with your actual provider settings:
 
 ```dotenv
 GOLDEN_BASE_URL=http://localhost:8001/v1
-GOLDEN_API_KEY=
-GOLDEN_GENERATOR_MODEL=your-generator-model
-GOLDEN_REVIEWER_MODEL=your-reviewer-model
-GOLDEN_DOCS_URL=http://localhost:8000
+GOLDEN_API_KEY=replace-with-your-provider-key
+GOLDEN_GENERATOR_MODEL=replace-with-your-generator-model
+GOLDEN_REVIEWER_MODEL=replace-with-your-reviewer-model
+GOLDEN_DOCS_URL=http://127.0.0.1:8000
 GOLDEN_HEADLESS=false
 GOLDEN_BROWSER_TIMEOUT_SECONDS=30
 GOLDEN_BROWSER_MAX_ACTIONS=200
 GOLDEN_MAX_SECTIONS=3
 ```
 
-The browser is visible by default. Set `GOLDEN_HEADLESS=true` for background runs.
-The runner connects to the app; it does not start or replace your server. Serve
-the exact registered Sphinx build directory. For example, after `make html`, a
-static preview can be started separately with:
+`GOLDEN_BASE_URL` is the **model API prefix**, such as your provider's `/v1` URL;
+the tool appends `/chat/completions`. It is different from `GOLDEN_DOCS_URL`, which
+is the documentation website Chromium will browse. The `8001` URL above is only
+an example; use it only if you actually run a compatible model server there.
+Leave `GOLDEN_API_KEY` blank only for an endpoint that does not require a key.
+Both model names must be available on that endpoint. A text-only model is sufficient.
+
+For this test, `GOLDEN_MAX_SECTIONS=3` limits each invocation to three completed
+section work items. `GOLDEN_HEADLESS=false` lets you watch the browser.
+
+### 3. Build and inventory a small test run — Terminal 2
+
+This creates a fresh database and documentation build. Copy the entire command:
 
 ```powershell
-venv/Scripts/python.exe -m http.server 8000 --bind 127.0.0.1 --directory _build/html
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/manual-test/run.sqlite3 inventory --build-dir _build/manual-test/site --page docs/products/kafka/howto/configure-log-cleaner.html --page docs/products/kafka/concepts/log-compaction.html
 ```
 
-Register the directory your app actually serves, including its `.doctrees`:
+Wait for Sphinx's `build succeeded` message and the inventory JSON. Check that
+`inventory_errors` is empty. No model API calls happen during this step.
+
+Sphinx builds the whole site so its links work, while this run's required coverage
+is limited to the two selected Kafka pages. The database stores progress; the
+`site` directory contains what the browser must see, plus source-mapping metadata.
+
+Run inventory **once per new run**. If these paths already contain a previous
+run, continue that run with `resume`, or choose a new folder name consistently in
+the commands below. Inventory will not overwrite an existing checkpoint or build.
+
+### 4. Start the documentation website — Terminal 1
+
+Open another PowerShell terminal in the repository root:
 
 ```powershell
-venv/Scripts/python.exe -m tools.golden_dataset inventory --use-existing-build --build-dir _build/html
-venv/Scripts/python.exe -m tools.golden_dataset generate
-venv/Scripts/python.exe -m tools.golden_dataset status
-venv/Scripts/python.exe -m tools.golden_dataset resume
-venv/Scripts/python.exe -m tools.golden_dataset review
+venv/Scripts/python.exe -m http.server 8000 --bind 127.0.0.1 --directory _build/manual-test/site
 ```
 
-`inventory` without `--use-existing-build` builds a fresh snapshot into the empty
-directory given by `--build-dir` (default `_build/golden-snapshot`). Your app must
-serve that build before generation. Served page bytes must match registered HTML;
-servers that inject scripts or rewrite responses need an unmodified preview.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser and confirm the
+Aiven documentation appears. **Leave Terminal 1 running.** If port 8000 is already
+in use, either use that server with its exact registered build, or choose another
+port here and update `GOLDEN_DOCS_URL` to match.
 
-The default checkpoint database is `_build/golden-dataset/run.sqlite3`. For a new
-run, use global `--db PATH` **before** each subcommand. Schema 1.0 and 2.0 databases
-are preserved but cannot resume as browser runs; create a new inventory/database.
-Source files and rendered content are hashed; changes invalidate the snapshot.
-Only select trusted local builds: Sphinx doctrees are Python pickle files.
+The served HTML must match the registered build byte for byte. For this workflow,
+serve `_build/manual-test/site` exactly as shown. A live-reload server that injects
+scripts into responses will fail the snapshot check.
 
-Environment variables override `.env`. `--env-file PATH` selects another file for
-`generate`/`resume`. Quoting/comments are supported, interpolation is disabled, and
-loading does not mutate process environment. API keys stay in memory, outside
-configuration hashes, checkpoints, and exports. `.env` and `.env.*` are ignored
-by Git except `.env.example`.
+### 5. Start the agent, check progress, and resume — Terminal 2
+
+With the documentation server and model API available, run:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/manual-test/run.sqlite3 generate
+```
+
+A Chromium window opens. The agent navigates the actual app and drafts questions;
+source verification and independent review follow each draft. The terminal can be
+quiet during browsing: it prints the result JSON when the invocation ends.
+
+After the section or action limit is reached, expect `runtime.status: "paused"`
+and exit code `2`. This is a saved checkpoint, not a completed dataset. A section
+work item ends after an accepted question or three rejected attempts, so the
+accepted-question count can be smaller than the section limit.
+
+Check progress, then run the next batch:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/manual-test/run.sqlite3 status
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/manual-test/run.sqlite3 resume
+```
+
+Repeat `resume` as needed. **Use the same `--db` every time; do not rerun inventory.**
+You can interrupt generation with Ctrl+C and resume later. Keep the documentation
+server running and keep the repository/build unchanged between batches.
+
+Useful status fields: `accepted`, `gaps`, `page_coverage`, `question_coverage`,
+`browsing_complete`, `runtime.error`, and `ready`. Browsing can be complete while
+`ready` remains false because human auditing has not passed.
+
+### 6. Inspect questions and evidence — Terminal 3
+
+Open another PowerShell terminal in the repository root:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/manual-test/run.sqlite3 review --port 8765
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Select a question to inspect
+its reference answer, saved browser observation, raw source excerpts, and file/line
+citations. Use Refresh to see new progress. Leave this terminal running while reviewing.
+
+You can inspect while generation is running, but **pause generation before saving
+review decisions, edits, or an audit sample**. The runner holds the write lock.
+After editing a question, run `resume` to revalidate it before approving it.
+
+### 7. Export your manual test — Terminal 2
+
+After generation has stopped or paused:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/manual-test/run.sqlite3 export --output _build/manual-test/export-candidates-v1
+```
+
+Inspect `questions.jsonl`, `observations.jsonl`, `coverage.json`, and `manifest.json`
+in that directory. This export is allowed before human auditing and is labeled
+`candidate_incomplete`. Each export destination must be empty; choose a new version
+directory for the next export.
+
+### 8. Run the full corpus and produce an audited export
+
+Keep Terminal 1 serving the same build; the small test built the entire site.
+In `.env`, clear the section limit:
+
+```dotenv
+GOLDEN_MAX_SECTIONS=
+```
+
+Create a **separate full-run database**, using the existing build and omitting
+the `--page` filters. In Terminal 2:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 inventory --use-existing-build --build-dir _build/manual-test/site
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 generate
+```
+
+The action cap still applies. When it pauses, continue with:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 resume
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 status
+```
+
+If desired, increase the positive integer `GOLDEN_BROWSER_MAX_ACTIONS` to allow
+more actions per invocation. Clearing `GOLDEN_MAX_SECTIONS` does not remove the
+action cap or cumulative token/cost limits.
+
+Once browsing is complete and question coverage is 100%, select the audit sample:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 audit
+```
+
+Stop the manual-test review server in Terminal 3 with Ctrl+C, then open the review
+interface for the **full-run database**:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 review --port 8765
+```
+
+Review the required audit records, fix/remove failures, and finish any expanded
+category reviews. After edits, revalidate with `resume`. Check `status` again.
+Only when `ready` is true, create the audited export in Terminal 2:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/full-run/run.sqlite3 export --output _build/full-run/export-v1 --ready-only
+```
+
+You can then stop the documentation and review servers with Ctrl+C. Their files
+and checkpoints remain on disk.
+
+## Using a build you already serve
+
+If your documentation app is already running, skip rebuilding/starting another
+server. Set `GOLDEN_DOCS_URL` to its URL, then register the **exact directory it
+serves**, including its `.doctrees` directory. For example, if it serves `_build/html`:
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/existing-app-run/run.sqlite3 inventory --use-existing-build --build-dir _build/html
+venv/Scripts/python.exe -m tools.golden_dataset --db _build/existing-app-run/run.sqlite3 generate
+```
+
+Use that database path for every subsequent command. The runner will not start,
+stop, or replace your existing server.
+
+## Common problems
+
+| Symptom | What to do |
+| --- | --- |
+| `Environment file not found` | Create repository-root `.env`, or pass `--env-file PATH` to `generate`/`resume`. |
+| Connection refused / documentation unavailable | Start Terminal 1's server and verify its URL matches `GOLDEN_DOCS_URL`. |
+| Served documentation differs from the registered build | Serve the directory registered during inventory. Check for live-reload HTML injection. |
+| API `401`, `404`, or preflight failure | Check the model API URL, key, and both model names. The tool appends `/chat/completions` to `GOLDEN_BASE_URL`. Fix `.env`, then resume. |
+| `paused`, exit code `2` | Read `runtime.error`; section/action caps are expected pauses. Resume, or adjust the relevant limit first. |
+| Token/cost budget exhausted | Increase the cumulative budget in `.env`, then resume the same database. |
+| Database already has a snapshot | Use `resume` for that run, or choose a fresh `--db` for a new inventory. |
+| Legacy checkpoint / snapshot changed | Create a new run and inventory. Old runs and exports remain available on disk. |
+| Review changes cannot be saved | Pause generation first; it holds the database write lock. |
+| Export not ready | Inspect `status`: resolve coverage gaps, verification failures, and the human audit gate. Use an ordinary candidate export for debugging. |
+
+Environment variables override `.env` file values. Quoting/comments are supported;
+interpolation is disabled. API keys stay in memory, outside configuration hashes,
+checkpoints, and exports. Actual `.env` files are ignored by Git. Only use trusted
+local Sphinx builds: `.doctrees` files are Python pickles.
 
 ## Actual browser behavior and coverage
 
