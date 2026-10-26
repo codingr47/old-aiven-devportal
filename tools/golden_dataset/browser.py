@@ -9,8 +9,9 @@ import yaml
 from playwright.sync_api import Error as BrowserError, sync_playwright
 
 from .model import Paused
-from .snapshot import UNIT_CHARS, digest, normalize
+from .snapshot import UNIT_CHARS, digest, normalize, served_html_matches
 from .storage import now
+from .tracing import trace, traced
 
 
 def role_name(key):
@@ -46,20 +47,28 @@ class Browser:
 
     def __enter__(self):
         try:
-            self.driver = sync_playwright().start()
-            self.browser = self.driver.chromium.launch(headless=self.config.get('headless', False))
+            with traced('browser', 'Starting Playwright driver'):
+                self.driver = sync_playwright().start()
+            with traced('browser', f'Launching Chromium; headless={self.config.get("headless", False)}'):
+                self.browser = self.driver.chromium.launch(
+                    headless=self.config.get('headless', False),
+                    timeout=self.config.get('browser_timeout_seconds', 30) * 1000)
             self.context = self.browser.new_context(viewport={'width': 1280, 'height': 900})
             self.context.set_default_timeout(self.config.get('browser_timeout_seconds', 30) * 1000)
             self.context.route('**/*', self.route)
             self.page = self.context.new_page()
+            if not self.config.get('headless', False):
+                self.page.bring_to_front()
             self.page.on('response', self.response)
             self.page.on('requestfailed', self.request_failed)
             url = self.state['browser'].get('last_url') or self.base
             self.state['browser']['discovered'].setdefault(self.base, {'label': 'Documentation home', 'from_url': None})
-            self.page.goto(url, wait_until='domcontentloaded')
-            self.check_page()
+            with traced('browser', f'Opening documentation: {url}'):
+                self.page.goto(url, wait_until='domcontentloaded')
+                self.check_page()
+            trace('browser', 'Documentation loaded; browser session ready')
             return self
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -67,6 +76,8 @@ class Browser:
         self.close()
 
     def close(self):
+        if self.driver:
+            trace('browser', 'Closing Chromium session')
         if self.context:
             self.context.close()
         if self.browser:
@@ -117,7 +128,7 @@ class Browser:
         page = self.page_id()
         if page in self.state['snapshot']['rendered_hashes']:
             response = self.context.request.get(self.page.url)
-            if response.status != 200 or digest(response.body()) != self.state['snapshot']['rendered_hashes'][page]:
+            if response.status != 200 or not served_html_matches(response.body(), self.state['snapshot']['rendered_hashes'][page]):
                 raise Paused('Served documentation differs from the registered build: ' + page)
             info = self.state['pages'][page]
             info['visited'] = True
@@ -216,7 +227,8 @@ class Browser:
         if scope not in {'main', 'page'}:
             raise ValueError('Observation scope must be main or page')
         self.check_page()
-        snapshot = self.page.locator('body').aria_snapshot(mode='ai')
+        with traced('observe', f'Reading {scope} accessibility observation'):
+            snapshot = self.page.locator('body').aria_snapshot(mode='ai')
         segments, controls, blocks, prose = self.parse_snapshot(snapshot)
         page = self.page_id()
         # Full snapshots are durable artifacts. Only delivered chunks count as read.
@@ -265,6 +277,8 @@ class Browser:
                     'heading_path': section['headings'], 'chunk_id': unit['id'], 'start': unit['start'], 'end': unit['end'],
                     'text': observation['text'][unit['start']:unit['end']], 'controls': visible_controls,
                     'remaining_chunks': sum(not x[2]['read'] for x in available), 'chunks': len(available),
+                    'cursor': available.index(chosen),
+                    'next_unread_cursor': next((i for i, x in enumerate(available) if not x[2]['read'] and x[2]['id'] != unit['id']), None),
                     'question_required': section['substantive'] and section['id'] not in completed and section['attempts'] < 3}
         self.allowed = {c['ref']: c for c in visible_controls}
         for control in visible_controls:

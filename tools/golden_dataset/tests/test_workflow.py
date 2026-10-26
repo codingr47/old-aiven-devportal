@@ -1,12 +1,18 @@
 """Integration tests use actual headless Chromium and a local compatible API."""
 
 import copy
+import contextlib
+import io
 import json
 import os
 import pickle
 import re
 import tempfile
 import threading
+import socket
+import subprocess
+import sys
+import time
 import unittest
 from functools import partial
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -23,9 +29,10 @@ from tools.golden_dataset.engine import run
 from tools.golden_dataset.model import Client, Config, InvalidOutput, Paused, load_config, parse_json
 from tools.golden_dataset.reporting import accepted, audit_result, export, report, select_audit
 from tools.golden_dataset.review import decide, make_server
-from tools.golden_dataset.snapshot import UNIT_CHARS, digest, inventory, verify_snapshot
+from tools.golden_dataset.snapshot import UNIT_CHARS, LIVE_RELOAD_LOADER, digest, inventory, verify_snapshot, served_html_matches
 from tools.golden_dataset.storage import Store
 from tools.golden_dataset.validation import RUBRIC, create_candidate, review_candidate, validate
+from tools.golden_dataset.tracing import traced
 
 RST = '''Kafka operations
 ================
@@ -385,12 +392,63 @@ class WorkflowTests(unittest.TestCase):
             view = browser.observe()
             self.assertGreater(view['chunks'], 1)
             self.assertLessEqual(len(view['text']), UNIT_CHARS)
+            self.assertEqual(view['cursor'], 0)
+            self.assertEqual(view['next_unread_cursor'], 1)
             browser.consume(view)
+            second = browser.tool('observe', {'scope': 'main', 'cursor': view['next_unread_cursor']})
+            self.assertNotEqual(second['chunk_id'], view['chunk_id'])
+            self.assertEqual(second['cursor'], 1)
+            browser.consume(second)
             self.assertFalse(report(self.state)['browsing_complete'])
             for _ in range(view['chunks']):
                 view = browser.observe()
                 browser.consume(view)
             self.assertTrue(report(self.state)['browsing_complete'])
+
+    def test_repeated_observation_loop_pauses_without_claiming_completion(self):
+        self.provider.navigation_policy = lambda view, payload: {
+            'tool': 'observe', 'arguments': {'scope': 'main', 'cursor': 0}}
+        result = run(self.store, self.provider.config)
+        self.assertEqual(result['runtime']['status'], 'paused')
+        self.assertIn('repeated the same action', result['runtime']['error'])
+        self.assertFalse(result['browsing_complete'])
+        requests = [json.loads(call['messages'][1]['content']) for call in self.provider.calls]
+        self.assertTrue(any(payload.get('feedback', {}).get('error_category') == 'repeated_action_without_progress'
+                            for payload in requests if payload.get('feedback')))
+
+    def test_browser_opens_before_preflight_and_failure_is_traced(self):
+        self.provider.fail_code = 401
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            result = run(self.store, self.provider.config)
+        self.assertEqual(result['runtime']['status'], 'paused')
+        self.assertEqual(self.store.load()['browser']['last_url'], self.provider.config['docs_url'] + '/')
+        messages = output.getvalue()
+        self.assertLess(messages.index('browser session ready'), messages.index('Checking generator and reviewer APIs'))
+        self.assertIn('[snapshot]', messages)
+        self.assertIn('[paused]', messages)
+        self.assertIn('Closing Chromium session', messages)
+
+    def test_visible_chromium_launch(self):
+        config = Config(self.provider.config)
+        config['headless'] = False
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), Browser(self.state, config, lambda: None) as browser:
+            self.assertTrue(browser.browser.is_connected())
+            self.assertEqual(browser.page.evaluate('document.visibilityState'), 'visible')
+        self.assertIn('Launching Chromium; headless=False', output.getvalue())
+
+    def test_trace_heartbeat_and_interruption(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(KeyboardInterrupt):
+                with traced('test', 'Controlled wait', interval=.01):
+                    time.sleep(.04)
+                    raise KeyboardInterrupt()
+        messages = output.getvalue()
+        self.assertIn('Still running: Controlled wait', messages)
+        self.assertIn('Failed/interrupted', messages)
+        self.assertRegex(messages, r'\[\d{4}-\d{2}-\d{2}T')
 
     def test_repeated_accessible_headings_keep_distinct_source_sections(self):
         (self.repo / 'index.rst').write_text('Kafka operations\n================\n\nOverview\n--------\n\nFirst topic.\n\nOverview\n--------\n\nSecond topic.\n')
@@ -609,12 +667,95 @@ class WorkflowTests(unittest.TestCase):
             with Browser(self.state, self.provider.config, lambda: None):
                 pass
 
+    def test_live_reload_loader_allowed_but_document_changes_rejected(self):
+        original = b'<html><head></head><body>Documentation</body></html>'
+        for port in (b'8000', b"(window.location.port || (window.location.protocol == 'https:' ? 443: 80))"):
+            served = original.replace(b'</head>', LIVE_RELOAD_LOADER % port + b'</head>')
+            self.assertTrue(served_html_matches(served, digest(original)))
+            self.assertFalse(served_html_matches(served.replace(b'Documentation', b'Changed'), digest(original)))
+            self.assertFalse(served_html_matches(served.replace(b'document.head.appendChild(s);', b'alert(1);document.head.appendChild(s);'), digest(original)))
+
+    def test_original_sphinx_autobuild_server_works_with_browser(self):
+        (self.build / 'index.html').write_text(PAGE.replace('<html>', '<html><head><title>Docs</title></head>'))
+        self.reset_inventory()
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        process = subprocess.Popen([sys.executable, '-m', 'sphinx_autobuild', str(self.repo), str(self.build),
+                                    '--no-initial', '--host', '127.0.0.1', '--port', str(port)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        try:
+            base = 'http://127.0.0.1:' + str(port)
+            for _ in range(100):
+                try:
+                    with urlopen(base, timeout=.2) as response:
+                        served = response.read()
+                    break
+                except OSError:
+                    if process.poll() is not None:
+                        self.fail('sphinx-autobuild exited before becoming ready: ' + process.communicate()[0].decode(errors='replace'))
+                    time.sleep(.05)
+            else:
+                self.fail('sphinx-autobuild did not start')
+            self.assertIn(b'/livereload.js?port=', served)
+            config = Config(self.provider.config)
+            config.update(docs_url=base)
+            config.api_key = 'synthetic-local-key'
+            with Browser(self.state, config, lambda: None) as browser:
+                view = browser.observe()
+                self.assertTrue(view['text'].startswith('The cleaner is enabled by default.'))
+            self.assertTrue(run(self.store, config)['browsing_complete'])
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if process.stdout:
+                process.stdout.close()
+
+    def test_generate_automatically_registers_existing_preview_build(self):
+        from tools.golden_dataset.__main__ import main
+        env = self.root / '.env'
+        env.write_text('GOLDEN_BASE_URL=' + self.provider.config['base_url'] + '\nGOLDEN_GENERATOR_MODEL=generator\nGOLDEN_REVIEWER_MODEL=reviewer\nGOLDEN_HEADLESS=true\nGOLDEN_DOCS_URL=' + self.provider.config['docs_url'] + '\n')
+        db = self.root / 'automatic.sqlite3'
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('GOLDEN_')}
+        with contextlib.chdir(self.repo), contextlib.redirect_stdout(io.StringIO()), patch.dict(os.environ, environment, clear=True):
+            code = main(['--db', str(db), 'generate', '--env-file', str(env), '--build-dir', str(self.build)])
+        self.assertEqual(code, 0)
+        self.assertTrue(report(Store(db).load())['browsing_complete'])
+
+    def test_generate_missing_build_reports_original_server_command(self):
+        from tools.golden_dataset.__main__ import main
+        env = self.root / '.env'
+        env.write_text('GOLDEN_BASE_URL=http://localhost:8001/v1\nGOLDEN_GENERATOR_MODEL=gen\nGOLDEN_REVIEWER_MODEL=judge\n')
+        error = io.StringIO()
+        with contextlib.chdir(self.repo), contextlib.redirect_stderr(error), patch.dict(os.environ, {}, clear=True):
+            code = main(['--db', str(self.root / 'missing-build.sqlite3'), 'generate', '--env-file', str(env)])
+        self.assertEqual(code, 1)
+        self.assertIn('make livehtml', error.getvalue())
+
     def test_source_changes_and_legacy_schema_are_rejected(self):
         (self.repo / 'docs/other.rst').write_text('Changed')
         with self.assertRaisesRegex(ValueError, 'snapshot changed'):
             verify_snapshot(self.state)
         self.state['schema_version'] = '2.0'
         with self.assertRaisesRegex(ValueError, 'Legacy checkpoint'):
+            verify_snapshot(self.state)
+
+    def test_commit_only_changes_keep_checkpoint_valid(self):
+        original_commit = self.state['snapshot']['commit']
+        original_snapshot = self.state['snapshot_id']
+        with patch('tools.golden_dataset.snapshot.commit', return_value='different-commit'):
+            verify_snapshot(self.state)
+        self.assertEqual(self.state['snapshot']['commit'], original_commit)
+        self.assertEqual(self.state['snapshot_id'], original_snapshot)
+
+    def test_snapshot_error_names_changed_documentation_inputs(self):
+        (self.repo / 'docs/other.rst').write_text('Changed documentation')
+        with self.assertRaisesRegex(ValueError, 'docs/other.rst.*--db _build/new-run.sqlite3 generate'):
             verify_snapshot(self.state)
 
     def test_navigation_suffix_and_missing_mapping(self):

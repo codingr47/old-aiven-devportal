@@ -12,6 +12,7 @@ from dotenv import dotenv_values
 
 from .snapshot import digest
 from .storage import now
+from .tracing import trace, traced
 
 
 class Paused(RuntimeError):
@@ -165,10 +166,12 @@ class Client:
                     "usage_estimated": True, "status": "reserved"}
             self.state["api_calls"].append(call)
             self.checkpoint()
+            started = time.monotonic()
             try:
                 request = Request(self.config["base_url"].rstrip("/") + "/chat/completions", data=body, headers=headers)
-                with urlopen(request, timeout=self.config.get("timeout_seconds", 120)) as response:
-                    data = json.loads(response.read(8 * 1024 * 1024))
+                with traced('api', f'Waiting for {role} model (attempt {attempt + 1}; timeout={self.config.get("timeout_seconds", 120)}s)'):
+                    with urlopen(request, timeout=self.config.get("timeout_seconds", 120)) as response:
+                        data = json.loads(response.read(8 * 1024 * 1024))
                 usage = data.get("usage") or {}
                 if all(isinstance(usage.get(k), int) and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
                     call.update(tokens=usage["prompt_tokens"] + usage["completion_tokens"],
@@ -182,6 +185,8 @@ class Client:
                     raise InvalidOutput("Model output was truncated or refused")
                 result = parse_json(choice["message"]["content"])
                 call["status"] = "complete"
+                call['duration_seconds'] = round(time.monotonic() - started, 3)
+                trace('api', f"{role} response validated in {call['duration_seconds']:.1f}s")
                 self.checkpoint()
                 return result
             except HTTPError as exc:
@@ -194,6 +199,7 @@ class Client:
                 self.checkpoint()
                 raise InvalidOutput("Invalid API response or model JSON") from None
             self.checkpoint()
+            trace('api', f"{role} failed: {call['status']}")
             if not transient or attempt == self.config.get("retries", 3) - 1:
                 raise Paused("API request failed (" + call["status"] + "); check provider configuration and resume.")
             time.sleep(min(2 ** attempt, 8))

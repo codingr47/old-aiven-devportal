@@ -12,9 +12,29 @@ from urllib.parse import unquote, urlsplit
 
 from .storage import now
 from .coverage import metadata, reachable
+from .tracing import trace
 
 UTILITY = {"search.html", "genindex.html", "404.html"}
 UNIT_CHARS = 6000
+
+# python-livereload's known development-only loader. Permit exactly this
+# addition immediately before </head>; all other response bytes must still match.
+LIVE_RELOAD_LOADER = (
+    b'<script type="text/javascript">(function(){'
+    b'var s=document.createElement("script");var port=%s;'
+    b's.src="//"+window.location.hostname+":"+port'
+    b'+ "/livereload.js?port=" + port;document.head.appendChild(s);'
+    b'})();</script>'
+)
+_LIVE_PORT = rb"(?:[0-9]{1,5}|\(window\.location\.port \|\| \(window\.location\.protocol == 'https:' \? 443: 80\)\))"
+_LIVE_LOADER_PATTERN = re.compile(re.escape(LIVE_RELOAD_LOADER).replace(b'%s', _LIVE_PORT) + rb'(?=</head>)')
+
+
+def served_html_matches(body, expected_hash):
+    if digest(body) == expected_hash:
+        return True
+    without_loader, count = _LIVE_LOADER_PATTERN.subn(b'', body, count=1)
+    return count == 1 and digest(without_loader) == expected_hash
 
 
 def digest(value):
@@ -91,13 +111,16 @@ def inventory(repo, build_dir, selection=None, build=True):
             raise ValueError(f"Unknown selected pages: {sorted(unknown)}")
         expected = [p for p in expected if p in selection]
     pages, sections, errors = {}, {}, []
-    for page in all_pages:
+    for index, page in enumerate(all_pages):
+        if index % 50 == 0:
+            trace('inventory', f'Processed {index}/{len(all_pages)} page metadata records')
         try:
             info, items = metadata(repo, build_dir, page, source_pages[page])
             pages[page] = info
             sections.update({s["id"]: s for s in items})
         except (OSError, ValueError) as exc:
             errors.append({"page": page, "error": type(exc).__name__ + ": " + str(exc)})
+    trace('inventory', f'Processed {len(all_pages)}/{len(all_pages)} pages; extraction errors={len(errors)}')
     rendered = {p: digest((build_dir / p).read_bytes()) for p in all_pages if (build_dir / p).is_file()}
     toc = (repo / "_toc.yml").read_text(encoding="utf-8") if (repo / "_toc.yml").exists() else ""
     navigation = []
@@ -127,8 +150,17 @@ def verify_snapshot(state):
     if state.get("schema_version") != "3.0":
         raise ValueError("Legacy checkpoint: create a new browser inventory for schema 3.0.")
     repo, build_dir = Path(state["repo"]), Path(state["build_dir"])
-    if commit(repo) != state["snapshot"]["commit"] or source_hashes(repo) != state["snapshot"]["source_hashes"]:
-        raise ValueError("Repository snapshot changed; create a new inventory.")
+    # Git HEAD is provenance, not content identity: committing tooling or README
+    # changes must not invalidate an unchanged documentation/build snapshot.
+    current = source_hashes(repo)
+    recorded = state['snapshot']['source_hashes']
+    changed = sorted(path for path in current.keys() | recorded.keys() if current.get(path) != recorded.get(path))
+    if changed:
+        details = ', '.join(changed[:5])
+        if len(changed) > 5:
+            details += f' (+{len(changed) - 5} more)'
+        raise ValueError('Repository snapshot changed: documentation inputs differ: ' + details +
+                         '. Start a fresh run with --db _build/new-run.sqlite3 generate.')
     for page, expected in state["snapshot"]["rendered_hashes"].items():
         path = build_dir / page
         if not path.is_file() or digest(path.read_bytes()) != expected:

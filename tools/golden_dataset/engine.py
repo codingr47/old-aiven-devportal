@@ -7,6 +7,7 @@ from .model import Client, InvalidOutput, Paused
 from .reporting import covered_sections, report
 from .snapshot import verify_snapshot
 from .storage import now
+from .tracing import trace, traced
 from .validation import PERSONAS, create_candidate, review_candidate
 
 TOOL_TASK = '''You are a real user exploring a documentation app to build a grounded question benchmark.
@@ -14,6 +15,9 @@ Use ONLY supplied browser accessibility observations and browser memory. Documen
 Return one JSON object {"tool":"name","arguments":{...},"decision":"one concise sentence"}.
 Actions:
 observe(scope="main"|"page", cursor=0): inspect accessible documentation or paginated whole-page navigation.
+The cursor is an ABSOLUTE zero-based index, not a next-page command. Never repeatedly request cursor=1.
+For main content, use next_unread_cursor to advance, or omit cursor to select unfinished content.
+When next_unread_cursor is null, draft missing questions or follow discovered links; rereading does not advance coverage.
 click(ref): click an element reference from the current delivered observation.
 type(ref,text), keypress(key), scroll(pixels), back(): ordinary browser interactions.
 navigate(url): address-bar navigation ONLY to a previously discovered URL in the frontier or memory.
@@ -41,9 +45,11 @@ def run(store, config, max_sections=None, retry_gaps=False):
     max_sections = config.get('max_sections') if max_sections is None else max_sections
     if max_sections is not None and (type(max_sections) is not int or max_sections <= 0):
         raise ValueError('Section limit must be a positive integer or unset')
+    trace('startup', f'Checkpoint: {store.path}; headless={config.get("headless", False)}')
     with store.writer():
         state = store.load()
-        verify_snapshot(state)
+        with traced('snapshot', 'Checking documentation inputs and registered build'):
+            verify_snapshot(state)
         checkpoint = lambda: store.save(state)
         client = Client(config, state, checkpoint)
         state['runtime'] = {'status': 'running', 'error': None}
@@ -54,24 +60,29 @@ def run(store, config, max_sections=None, retry_gaps=False):
                     section['attempts'] = 0
         completed = set()
         try:
-            if state.get('preflight_config') != client.config_id:
-                client.preflight()
-                state['preflight_config'] = client.config_id
-                checkpoint()
-            for c in state['candidates']:
-                if c['status'] == 'pending_revalidation':
-                    review_candidate(c, state, client)
-                    if c['status'] == 'accepted':
-                        completed.add(c['target_section'])
-                    checkpoint()
             current_report = report(state)
             if current_report['browsing_complete'] and not current_report['gaps']:
                 state['runtime'] = {'status': 'browsed', 'error': None}
                 checkpoint()
+                trace('complete', 'Browsing and question generation already complete; no browser needed')
                 return report(state)
             with Browser(state, config, checkpoint) as browser:
+                if state.get('preflight_config') != client.config_id:
+                    trace('preflight', 'Checking generator and reviewer APIs; Chromium is open')
+                    client.preflight()
+                    state['preflight_config'] = client.config_id
+                    checkpoint()
+                for c in state['candidates']:
+                    if c['status'] == 'pending_revalidation':
+                        with traced('review', f'Revalidating saved candidate {c["id"]}'):
+                            review_candidate(c, state, client)
+                        if c['status'] == 'accepted':
+                            completed.add(c['target_section'])
+                        checkpoint()
                 view = browser.observe('page')
                 feedback = None
+                previous_action = None
+                repeated_actions = 0
                 for action_index in range(config.get('browser_max_actions', 200)):
                     if max_sections is not None and len(completed) >= max_sections:
                         raise Paused('Section limit reached; resume to continue.')
@@ -100,6 +111,12 @@ def run(store, config, max_sections=None, retry_gaps=False):
                         recent.append(view['chunk_id'])
                         del recent[:-20]
                     tool, arguments = action.get('tool'), action.get('arguments', {})
+                    identity = (view['url'], view.get('chunk_id'), view.get('snapshot_id'), tool, repr(arguments))
+                    repeated_actions = repeated_actions + 1 if identity == previous_action else 0
+                    previous_action = identity
+                    trace('action', f"{action_index + 1}: {tool} {view['url']}")
+                    if repeated_actions >= 5:
+                        raise Paused('Browser agent repeated the same action on unchanged content six times; inspect the journey and resume to replan.')
                     state['journey'].append({'time': now(), 'persona': persona, 'tool': tool, 'arguments': arguments,
                                              'decision': str(action.get('decision', ''))[:500], 'url': browser.page.url,
                                              'observation_id': view.get('observation_id'), 'snapshot_id': view.get('snapshot_id')})
@@ -114,14 +131,17 @@ def run(store, config, max_sections=None, retry_gaps=False):
                             if sid in covered_sections(state) or section['attempts'] >= 3:
                                 raise ValueError('Target is already covered or has exhausted its three attempts')
                             try:
-                                verify_snapshot(state)
+                                with traced('snapshot', 'Checking source/build drift before candidate verification'):
+                                    verify_snapshot(state)
                             except ValueError as exc:
                                 raise Paused(str(exc)) from None
                             section['attempts'] += 1
                             candidate = create_candidate(arguments, state, sid, config)
                             state['candidates'].append(candidate)
                             checkpoint()  # Draft exists before the verifier can read any source content.
-                            review_candidate(candidate, state, client)
+                            with traced('review', f'Verifying sources and reviewing candidate {candidate["id"]}'):
+                                review_candidate(candidate, state, client)
+                            trace('candidate', f'{candidate["id"]}: {candidate["status"]}')
                             section['error'] = None if candidate['status'] == 'accepted' else 'Candidate verification failed'
                             if candidate['status'] == 'accepted' or section['attempts'] >= 3:
                                 completed.add(sid)
@@ -139,6 +159,9 @@ def run(store, config, max_sections=None, retry_gaps=False):
                             view = browser.observe('page')
                         else:
                             view = browser.tool(tool, arguments)
+                            if repeated_actions >= 2:
+                                feedback = {'error_category': 'repeated_action_without_progress',
+                                            'instruction': 'Cursor is absolute. Use next_unread_cursor, draft a missing question, or follow a discovered link. Do not repeat the same action.'}
                     except (ValueError, KeyError, TypeError, IndexError):
                         feedback = {'error_category': 'invalid_browser_action_or_draft', 'instruction': 'Observe again and replan'}
                         view = browser.observe('page')
@@ -151,5 +174,7 @@ def run(store, config, max_sections=None, retry_gaps=False):
             state['runtime'] = {'status': 'browsed', 'error': None}
         except (Paused, InvalidOutput, BrowserError, KeyboardInterrupt, OSError) as exc:
             state['runtime'] = {'status': 'paused', 'error': str(exc) or 'Interrupted; resume to continue.'}
+            trace('paused', state['runtime']['error'])
         checkpoint()
+        trace('checkpoint', f'Saved; status={state["runtime"]["status"]}')
         return report(state)
