@@ -22,7 +22,7 @@ def main(argv=None):
     for name in ("generate", "resume"):
         cmd = subs.add_parser(name)
         cmd.add_argument("--env-file", default=".env", help="Environment file (default: .env); environment variables override file values")
-        cmd.add_argument("--max-sections", type=int)
+        cmd.add_argument("--max-sections", type=int, help="Target sections per invocation; overrides GOLDEN_MAX_SECTIONS")
         cmd.add_argument("--retry-gaps", action="store_true", help="Explicitly retry exhausted sections for three more attempts")
     subs.add_parser("status")
     audit = subs.add_parser("audit", help="Freeze the reproducible audit sample")

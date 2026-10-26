@@ -91,6 +91,10 @@ class Browser:
 
 
 def run(store, config, max_sections=None, retry_gaps=False):
+    if max_sections is None:
+        max_sections = config.get("max_sections")
+    if max_sections is not None and (type(max_sections) is not int or max_sections <= 0):
+        raise ValueError("Section limit must be a positive integer or unset")
     with store.writer():
         state = store.load()
         verify_snapshot(state)

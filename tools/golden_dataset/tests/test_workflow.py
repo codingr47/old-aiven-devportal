@@ -407,6 +407,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(result['browsing_complete'])
         self.assertEqual(len(self.store.load()['candidates']), result['accepted'])
 
+    def test_configured_section_limit_pauses_and_cli_style_override_resumes(self):
+        config = {**self.provider.config, 'max_sections': 1}
+        result = run(self.store, config)
+        self.assertEqual(result['runtime']['status'], 'paused')
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['accepted'], 1)
+        previous = {c['id'] for c in accepted(self.store.load())}
+        result = run(self.store, config, max_sections=10)
+        self.assertTrue(result['browsing_complete'])
+        self.assertTrue(previous.issubset({c['id'] for c in accepted(self.store.load())}))
+
     def test_reasoning_journey_reads_linked_page_and_generates_cross_page_labels(self):
         self.provider.explore_links = True
         config = {**self.provider.config, 'agent_steps': 3}
@@ -578,6 +589,7 @@ GOLDEN_PARAMETERS='{"max_completion_tokens":1024,"reasoning_effort":"low"}'
             path.write_text(base)
             config = load_config(path)
             self.assertEqual(config['parameters']['max_tokens'], 4096)
+            self.assertIsNone(config['max_sections'])
             path.write_text(base + 'GOLDEN_GENERATOR_INPUT_PER_MILLION=1\nGOLDEN_GENERATOR_OUTPUT_PER_MILLION=4\nGOLDEN_REVIEWER_INPUT_PER_MILLION=2\nGOLDEN_REVIEWER_OUTPUT_PER_MILLION=6\nGOLDEN_MAX_COST=20\n')
             config = load_config(path)
             self.assertEqual(config['pricing']['judge']['output_per_million'], 6)
@@ -587,6 +599,21 @@ GOLDEN_PARAMETERS='{"max_completion_tokens":1024,"reasoning_effort":"low"}'
                     load_config(path)
             with self.assertRaisesRegex(ValueError, 'not found'):
                 load_config(self.root / 'missing.env')
+
+    def test_env_section_limit_parsing_and_precedence(self):
+        path = self.root / '.env'
+        base = 'GOLDEN_BASE_URL=http://localhost:8001/v1\nGOLDEN_GENERATOR_MODEL=gen\nGOLDEN_REVIEWER_MODEL=judge\n'
+        with patch.dict(os.environ, {}, clear=True):
+            for setting, expected in [('', None), ('3', 3)]:
+                path.write_text(base + 'GOLDEN_MAX_SECTIONS=' + setting + '\n')
+                self.assertEqual(load_config(path)['max_sections'], expected)
+            for setting in ('0', '-1', '1.5', 'invalid'):
+                path.write_text(base + 'GOLDEN_MAX_SECTIONS=' + setting + '\n')
+                with self.assertRaisesRegex(ValueError, 'GOLDEN_MAX_SECTIONS'):
+                    load_config(path)
+            path.write_text(base + 'GOLDEN_MAX_SECTIONS=3\n')
+            with patch.dict(os.environ, {'GOLDEN_MAX_SECTIONS': '2'}):
+                self.assertEqual(load_config(path)['max_sections'], 2)
 
 
 if __name__ == '__main__':

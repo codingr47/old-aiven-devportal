@@ -73,8 +73,11 @@ def load_config(path=".env"):
                     reviewer_model=values.get("GOLDEN_REVIEWER_MODEL", ""),
                     parameters=parameters, timeout_seconds=number("GOLDEN_TIMEOUT_SECONDS", 120),
                     retries=number("GOLDEN_RETRIES", 3), agent_steps=number("GOLDEN_AGENT_STEPS", 5),
+                    max_sections=number("GOLDEN_MAX_SECTIONS"),
                     max_tokens=number("GOLDEN_MAX_TOKENS"), max_cost=number("GOLDEN_MAX_COST", convert=float), pricing={})
     config.api_key = values.get("GOLDEN_API_KEY") or ""
+    if config["max_sections"] is not None and config["max_sections"] <= 0:
+        raise ValueError("GOLDEN_MAX_SECTIONS must be a positive integer or blank")
     for role in ("generator", "reviewer"):
         price = {}
         for kind in ("input", "output"):

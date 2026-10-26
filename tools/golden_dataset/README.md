@@ -46,6 +46,21 @@ another file. Files support dotenv quoting and comments; interpolation is disabl
 so literal characters in credentials are preserved. The loader does not modify
 the process environment. Missing files or invalid settings fail before API calls.
 
+For a small manual test, set this optional value in `.env`:
+
+```dotenv
+GOLDEN_MAX_SECTIONS=3
+```
+
+Each `generate` or `resume` invocation processes at most three queued target
+sections, checkpoints, and pauses with exit code `2` if work remains. Run `resume`
+for the next batch. Leave the value blank or remove it to process the full queue;
+`--max-sections N` overrides the environment setting for that invocation.
+The limit applies to target sections, not pages, questions, or API requests;
+linked evidence may also be read during a section's browsing journey. Inventory
+still covers the full selected corpus, and limited runs retain incomplete
+coverage rather than claiming the dataset is ready.
+
 `--page` restricts the inventory and its coverage denominator; a scoped run never
 claims to cover the full repository. A scoped run still builds the full Sphinx
 site. `inventory --use-existing-build --build-dir PATH` explicitly skips building;
