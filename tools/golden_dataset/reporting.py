@@ -101,11 +101,16 @@ def audit_result(state):
 
 
 def report(state):
-    sections = list(state["sections"].values())
+    mandatory = set(state['expected_pages'])
+    sections = [s for s in state["sections"].values() if s['page'] in mandatory]
     substantive = [s for s in sections if s["substantive"]]
     covered = covered_sections(state)
-    read = lambda s: all(u["read"] for u in s["units"])
-    pages_read = sum(all(read(state["sections"][sid]) for sid in p["sections"]) for p in state["pages"].values())
+    read = lambda s: s.get('observed', False) and all(u["read"] for u in s["units"])
+    def page_read(p):
+        return (p['visited'] and not p.get('pending_error') and
+                all(read(state['sections'][sid]) for sid in p['sections']) and
+                all(c['visited'] and c['observation_consumed'] for c in p['controls'].values()))
+    pages_read = sum(page_read(p) for ident, p in state["pages"].items() if ident in mandatory)
     records = accepted(state)
     integrity = sum(not validate(c, state, check_duplicates=False) for c in records)
     candidates = state["candidates"]
@@ -120,6 +125,10 @@ def report(state):
     ready = browsing_complete and bool(records) and not gaps and integrity == len(records) and audit["passed"]
     return {"snapshot_id": state["snapshot_id"], "browsing_complete": browsing_complete, "ready": ready,
             "runtime": state["runtime"], "inventory_errors": state["inventory_errors"],
+            "coverage_audit": state['coverage_audit'],
+            "unresolved_controls": {p: c['controls'] for p, c in state['pages'].items() if p in mandatory and
+                                    any(not v['visited'] or not v['observation_consumed'] for v in c['controls'].values())},
+            "search_failures": state['browser']['search_failures'],
             "page_coverage": ratio(pages_read, len(state["expected_pages"])),
             "section_reading_coverage": ratio(sum(read(s) for s in sections), len(sections)),
             "reading_unit_coverage": ratio(sum(u["read"] for s in sections for u in s["units"]), sum(len(s["units"]) for s in sections)),
@@ -147,16 +156,18 @@ def export(state, destination, ready_only=False):
         raise ValueError("Export directory must be empty; use a new version directory.")
     def write(name, value):
         (target / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    source_sections = [{"id": s["source_section_id"], "document_path": s["document_path"],
+    source_sections = [{"id": public_section_id(state, s['id']), "document_path": s["document_path"],
                         "heading_path": s["headings"], "source": s["source"],
-                        "text": s["source"]["excerpt"], "substantive": s["substantive"],
+                        "text": s["source"]["excerpt"] if s['source'] else None, "substantive": s["substantive"],
                         "exclusion_reason": s["exclusion_reason"],
                         "browsing": {"section_id": s["id"], "page": s["page"], "anchor": s["anchor"],
-                                     "text": s["text"], "units": s["units"], "source_mappings": s["source_mappings"]}}
-                       for s in state["sections"].values()]
+                                     "text": s["text"], "units": s["units"]}}
+                       for s in state["sections"].values() if s['page'] in state['expected_pages']]
     for name, records in (("questions.jsonl", (public_candidate(state, c) for c in accepted(state))),
                           ("candidates.jsonl", (public_candidate(state, c) for c in state["candidates"])),
-                          ("sections.jsonl", source_sections), ("journey.jsonl", state["journey"])):
+                          ("sections.jsonl", source_sections), ("journey.jsonl", state["journey"]),
+                          ("observations.jsonl", state['observations'].values()),
+                          ("accessibility-snapshots.jsonl", ({'id': k, **v} for k, v in state.get('accessibility_snapshots', {}).items()))):
         with (target / name).open("w", encoding="utf-8") as stream:
             for record in records:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -170,6 +181,7 @@ def export(state, destination, ready_only=False):
                             "release_status": "audited_ready" if metrics["ready"] else "candidate_incomplete",
                             "documents": sorted({p["source_path"] for p in state["pages"].values()}),
                             "browsing": {"pages": state["pages"], "expected_pages": state["expected_pages"]},
+                            "execution_mode": state['execution_mode'], "coverage_audit": state['coverage_audit'],
                             "audit": state["audit"], "audit_history": state.get("audit_history", []), "api_calls": state["api_calls"],
                             "files": {p.name: digest(p.read_bytes()) for p in sorted(target.iterdir())}})
     return metrics

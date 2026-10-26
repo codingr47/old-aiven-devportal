@@ -35,6 +35,6 @@ See the output on [http://localhost:8000](http://localhost:8000).
 
 ## Golden dataset generator
 
-Generate evidence-backed documentation questions, track complete browsing coverage,
+Generate evidence-backed documentation questions using a real Chromium browser, track browsing coverage,
 and audit candidates in a local review interface. See the
 [generator usage guide](tools/golden_dataset/README.md) for setup, metrics, and export instructions.

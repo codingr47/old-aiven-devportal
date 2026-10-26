@@ -11,10 +11,10 @@ from .storage import Store
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Snapshot-grounded documentation golden dataset generator")
+    parser = argparse.ArgumentParser(description="Browser-driven documentation golden dataset generator")
     parser.add_argument("--db", default="_build/golden-dataset/run.sqlite3", help="Checkpoint database")
     subs = parser.add_subparsers(dest="command", required=True)
-    inv = subs.add_parser("inventory", help="Build a fresh Sphinx snapshot and inventory all content")
+    inv = subs.add_parser("inventory", help="Build/register a Sphinx snapshot and audit navigation/source metadata")
     inv.add_argument("--repo", default=".")
     inv.add_argument("--build-dir", default="_build/golden-snapshot")
     inv.add_argument("--use-existing-build", action="store_true", help="Explicitly use an existing build (not verified fresh)")
@@ -50,6 +50,8 @@ def main(argv=None):
             output = run(store, load_config(args.env_file), args.max_sections, args.retry_gaps)
         elif args.command == "status":
             state = store.load()
+            if state.get('schema_version') != '3.0':
+                raise ValueError('Legacy checkpoint: create a new browser inventory for schema 3.0.')
             output = report(state)
             try:
                 verify_snapshot(state)

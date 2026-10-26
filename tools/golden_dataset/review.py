@@ -105,9 +105,12 @@ def make_server(store, port=8765):
                             continue
                         sid = e.get("section_id")
                         s = state["sections"].get(sid) if isinstance(sid, str) else None
-                        evidence.append({**e, "text": s["text"] if s else "Missing section",
+                        obs = state.get('observations', {}).get(e.get('observation_id'), {})
+                        evidence.append({**e, "text": obs.get('text', 'Missing browser observation'),
+                                         "browser_url": obs.get('url'), "snapshot_id": obs.get('snapshot_id'),
+                                         "accessibility_snapshot": state.get('accessibility_snapshots', {}).get(obs.get('snapshot_id'), {}).get('text'),
                                          "headings": s["headings"] if s else [],
-                                         "source_section_id": s["source_section_id"] if s else "Missing source",
+                                         "source_section_id": s.get("source_section_id") if s else "Missing source",
                                          "document_path": s["document_path"] if s else None})
                 return self.send({"candidate": c, "evidence": evidence})
             return self.send({"error": "Not found"}, 404)

@@ -72,10 +72,21 @@ def load_config(path=".env"):
                     generator_model=values.get("GOLDEN_GENERATOR_MODEL", ""),
                     reviewer_model=values.get("GOLDEN_REVIEWER_MODEL", ""),
                     parameters=parameters, timeout_seconds=number("GOLDEN_TIMEOUT_SECONDS", 120),
-                    retries=number("GOLDEN_RETRIES", 3), agent_steps=number("GOLDEN_AGENT_STEPS", 5),
+                    retries=number("GOLDEN_RETRIES", 3),
+                    docs_url=values.get("GOLDEN_DOCS_URL") or "http://localhost:8000",
+                    headless=(values.get("GOLDEN_HEADLESS") or "false").lower() == "true",
+                    browser_timeout_seconds=number("GOLDEN_BROWSER_TIMEOUT_SECONDS", 30),
+                    browser_max_actions=number("GOLDEN_BROWSER_MAX_ACTIONS", 200),
                     max_sections=number("GOLDEN_MAX_SECTIONS"),
                     max_tokens=number("GOLDEN_MAX_TOKENS"), max_cost=number("GOLDEN_MAX_COST", convert=float), pricing={})
     config.api_key = values.get("GOLDEN_API_KEY") or ""
+    if (values.get("GOLDEN_HEADLESS") or "false").lower() not in {"true", "false"}:
+        raise ValueError("GOLDEN_HEADLESS must be true or false")
+    docs = urlsplit(config["docs_url"])
+    if docs.scheme not in {"http", "https"} or not docs.netloc or docs.username or docs.password or docs.query or docs.fragment:
+        raise ValueError("GOLDEN_DOCS_URL must be an HTTP(S) base URL without credentials, query, or fragment")
+    if config["browser_timeout_seconds"] <= 0 or config["browser_max_actions"] <= 0:
+        raise ValueError("Browser timeout and action limit must be positive integers")
     if config["max_sections"] is not None and config["max_sections"] <= 0:
         raise ValueError("GOLDEN_MAX_SECTIONS must be a positive integer or blank")
     for role in ("generator", "reviewer"):
@@ -106,8 +117,8 @@ def load_config(path=".env"):
     output_limit = config["parameters"].get("max_completion_tokens", config["parameters"].get("max_tokens"))
     if not isinstance(output_limit, int) or output_limit <= 0:
         raise ValueError("parameters must set a positive max_tokens or max_completion_tokens")
-    if not 1 <= config.get("retries", 3) <= 5 or not 0 <= config.get("agent_steps", 5) <= 12:
-        raise ValueError("retries must be 1..5 and agent_steps 0..12")
+    if not 1 <= config.get("retries", 3) <= 5:
+        raise ValueError("retries must be 1..5")
     if not 1 <= config.get("timeout_seconds", 120) <= 600:
         raise ValueError("timeout_seconds must be 1..600")
     if config.get("max_cost"):

@@ -153,7 +153,8 @@ def evidence_sources(section, start, end):
 
 
 def public_section_id(state, sid):
-    return state["sections"][sid]["source_section_id"]
+    section = state["sections"][sid]
+    return section.get("source_section_id") or section['document_path'] + '::unverified:' + section['anchor']
 
 
 def public_candidate(state, record):
@@ -162,10 +163,7 @@ def public_candidate(state, record):
     result["target_section"] = public_section_id(state, record["target_section"])
     result["document_path"] = state["sections"][record["target_section"]]["document_path"]
     result["browsing"] = {"target_section": record["target_section"], "related_links": result.get("related_links")}
-    links = state["pages"][state["sections"][record["target_section"]]["page"]]["links"]
-    related = record.get("related_links") or []
-    result["related_links"] = sorted({state["pages"][link["target"]["page"]]["source_path"] for link in links
-                                      if link["href"] in related and link.get("target") and link["target"]["page"] in state["pages"]})
+    result["related_links"] = []
     for group in result.get("evidence_groups") or []:
         if not isinstance(group, dict) or not isinstance(group.get("alternatives"), list):
             continue
@@ -173,8 +171,36 @@ def public_candidate(state, record):
             if not isinstance(evidence, dict) or not isinstance(evidence.get("section_id"), str) or evidence["section_id"] not in state["sections"]:
                 continue
             section = state["sections"][evidence["section_id"]]
-            evidence["section_id"] = section["source_section_id"]
+            evidence["section_id"] = public_section_id(state, section['id'])
             evidence["document_path"] = section["document_path"]
             evidence["heading_path"] = section["headings"]
             evidence["browsing"] = {k: evidence.pop(k) for k in ("page", "anchor", "excerpt", "start", "end") if k in evidence}
     return result
+
+
+def resolve_browser_evidence(state, evidence):
+    """Called only after a draft is persisted; never available to the generator."""
+    from .snapshot import digest
+    ident = evidence.get('observation_id')
+    obs = state['observations'].get(ident) if isinstance(ident, str) else None
+    if not obs or not isinstance(evidence.get('excerpt'), str) or not evidence['excerpt'].strip():
+        raise ValueError('Unknown browser observation or empty quote')
+    section = state['sections'][obs['section_id']]
+    start = evidence.get('start', obs['text'].find(evidence['excerpt']))
+    if type(start) is not int:
+        raise ValueError('Invalid browser quote offset')
+    end = start + len(evidence['excerpt'])
+    if start < 0 or obs['text'][start:end] != evidence['excerpt']:
+        raise ValueError('Quote does not match its browser observation')
+    if not any(u['read'] and u['start'] <= start and u['end'] >= end for u in obs['chunks']):
+        raise ValueError('Quoted observation chunk was not consumed')
+    transient = {**section, 'text': obs['text'], 'rendered_blocks': obs.get('blocks', []), 'substantive': True}
+    attach_sources(Path(state['repo']), Path(state['build_dir']), obs['page'], {}, [transient], section['document_path'])
+    spans = evidence_sources(transient, start, end)
+    if not spans:
+        raise ValueError('Browser evidence cannot be mapped to repository source')
+    for span in spans:
+        if digest((Path(state['repo']) / span['source_path']).read_bytes()) != state['snapshot']['source_hashes'].get(span['source_path']):
+            raise ValueError('Source snapshot changed')
+    evidence.update(section_id=section['id'], page=obs['page'], anchor=section['anchor'], start=start, end=end, source_spans=spans)
+    section['source_section_id'], section['source'] = transient['source_section_id'], transient['source']
