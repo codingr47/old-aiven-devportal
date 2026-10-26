@@ -1,5 +1,11 @@
 furo==2022.06.21
 sphinx==4.3.2
+# Keep bundled builders compatible with Sphinx 4.
+sphinxcontrib-applehelp==1.0.4
+sphinxcontrib-devhelp==1.0.2
+sphinxcontrib-htmlhelp==2.0.1
+sphinxcontrib-qthelp==1.0.3
+sphinxcontrib-serializinghtml==1.1.5
 sphinx-autobuild==2021.3.14
 sphinx-design==0.2.0
 sphinxcontrib-mermaid==0.7.1
