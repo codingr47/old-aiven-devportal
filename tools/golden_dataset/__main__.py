@@ -3,7 +3,8 @@ import json
 import sys
 from pathlib import Path
 
-from .engine import run
+from .benchmark import benchmark
+from .engine import paraphrase_existing, run
 from .model import load_config
 from .reporting import export, report, select_audit
 from .review import serve
@@ -37,6 +38,12 @@ def main(argv=None):
     exp = subs.add_parser("export")
     exp.add_argument("--output", required=True)
     exp.add_argument("--ready-only", action="store_true")
+    exp.add_argument("--format", choices=("full", "benchmark"), default="full",
+                     help="full: every internal record; benchmark: queries and relevant source locations only")
+    exp.add_argument("--approved-only", action="store_true",
+                     help="benchmark only: export just the questions approved in review")
+    para = subs.add_parser("paraphrase", help="Add reviewed paraphrases to accepted questions that lack one")
+    para.add_argument("--env-file", default=".env", help="Environment file (default: .env)")
     args = parser.parse_args(argv)
     if args.command in {'generate', 'resume', 'inventory'}:
         trace('startup', f'{args.command}; database={Path(args.db).resolve()}')
@@ -74,6 +81,8 @@ def main(argv=None):
                     elif args.build_dir and Path(args.build_dir).resolve() != Path(store.load()['build_dir']):
                         raise ValueError('This run already has a build directory; use a new --db to change it.')
             output = run(store, config, args.max_sections, args.retry_gaps)
+        elif args.command == "paraphrase":
+            output = paraphrase_existing(store, load_config(args.env_file))
         elif args.command == "status":
             state = store.load()
             if state.get('schema_version') != '3.1':
@@ -95,7 +104,12 @@ def main(argv=None):
                     output = select_audit(state, args.new_round)
         else:
             with store.writer():
-                output = export(store.load(), args.output, args.ready_only)
+                if args.format == "benchmark":
+                    output = benchmark(store.load(), args.output, args.ready_only, args.approved_only)
+                elif args.approved_only:
+                    raise ValueError("--approved-only requires --format benchmark")
+                else:
+                    output = export(store.load(), args.output, args.ready_only)
         print(json.dumps(output, indent=2, ensure_ascii=False))
         return 2 if output.get("runtime", {}).get("status") == "paused" else 0
     except (ValueError, OSError) as exc:

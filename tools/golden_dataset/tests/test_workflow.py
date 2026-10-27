@@ -1,6 +1,7 @@
 """Integration tests use actual headless Chromium and a local compatible API."""
 
 import copy
+import hashlib
 import contextlib
 import io
 import json
@@ -25,7 +26,8 @@ from docutils import nodes
 from docutils.utils import new_document
 
 from tools.golden_dataset.browser import Browser
-from tools.golden_dataset.engine import run
+from tools.golden_dataset.benchmark import benchmark
+from tools.golden_dataset.engine import paraphrase_existing, run
 from tools.golden_dataset.model import Client, Config, InvalidOutput, Paused, load_config, parse_json
 from tools.golden_dataset.reporting import accepted, audit_result, export, report, select_audit
 from tools.golden_dataset.review import decide, make_server
@@ -118,6 +120,7 @@ class MockProvider:
         self.calls, self.seen, self.asked = [], set(), set()
         self.fail_code = self.fail_review = None
         self.bad_generation = self.bad_review = self.force_finish = self.cross_page = False
+        self.paraphrase_ok = True
         self.navigation_policy = None
         owner = self
 
@@ -137,8 +140,13 @@ class MockProvider:
                 if 'Connectivity check' in task:
                     result = {'ok': True}
                 elif 'Independently assess' in task:
-                    result = {'checks': {key: True for key in RUBRIC}, 'notes': 'Synthetic review: sources support the supplied claims.'}
+                    result = {'checks': {**{key: True for key in RUBRIC}, 'paraphrase_equivalent': owner.paraphrase_ok},
+                              'notes': 'Synthetic review: sources support the supplied claims.'}
                     bad = owner.bad_review
+                elif 'Rewrite the question' in task:
+                    result = {'paraphrase': 'Put differently, ' + payload['question']}
+                elif 'paraphrase_equivalent' in task:
+                    result = {'paraphrase_equivalent': owner.paraphrase_ok}
                 else:
                     view = payload['browser']
                     owner.seen.add(view['page'])
@@ -158,6 +166,7 @@ class MockProvider:
                             candidate = raw_candidate(item['section_id'], item['observation_id'], excerpt,
                                                       'What should I do about ' + item['heading_path'][-1] + '?')
                             del candidate['target_section']
+                            candidate['paraphrase'] = 'How would I handle ' + item['heading_path'][-1] + '?'
                             other = next((m for m in payload.get('memory', []) if m['page'] != view['page']), None)
                             if owner.cross_page and other:
                                 extra = re.split(r'(?<=[.!?])\s', other['text'])[0]
@@ -570,6 +579,84 @@ class WorkflowTests(unittest.TestCase):
                     for span in e['source_spans']:
                         text = (self.repo / span['source_path']).read_text(encoding='utf-8-sig')
                         self.assertEqual(text[span['start']:span['end']], span['excerpt'])
+
+    def test_benchmark_export_contains_only_queries_and_exact_source_locations(self):
+        run(self.store, self.provider.config)
+        state = self.store.load()
+        counts = benchmark(state, self.root / 'bench')
+        records = [json.loads(line) for line in (self.root / 'bench/queries.jsonl').read_text(encoding='utf-8').splitlines()]
+        manifest = json.loads((self.root / 'bench/manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual(set(manifest['counts']['by_variant']), {'original', 'paraphrase'})
+        self.assertEqual(counts['questions'], len(accepted(state)))
+        self.assertEqual({path.name for path in (self.root / 'bench').iterdir()}, {'queries.jsonl', 'manifest.json'})
+        text = (self.root / 'bench/queries.jsonl').read_text(encoding='utf-8')
+        for private in ('reference_answer', 'required_facts', 'observation_id', 'browsing', 'provenance', '.html'):
+            self.assertNotIn(private, text)
+        for record in records:
+            self.assertEqual(set(record), {'id', 'group_id', 'variant', 'query', 'relevant', 'sections', 'documents', 'tags'})
+            for group in record['relevant']:
+                for location in group['any_of']:
+                    # Offsets address LF-normalized text, so CRLF and LF checkouts agree.
+                    source = (self.repo / location['path']).read_bytes().decode('utf-8-sig').replace('\r\n', '\n')
+                    self.assertEqual(source[location['start']:location['end']], location['text'])
+                    self.assertEqual(source.count('\n', 0, location['start']) + 1, location['line_start'])
+                    self.assertEqual(manifest['docs']['source_files'][location['path']],
+                                     hashlib.sha256(source.encode('utf-8')).hexdigest())
+                    self.assertIn(location['path'], record['documents'])
+            for section in record['sections']:
+                self.assertEqual(section['heading_path'][-1] if section['heading_path'] else '', state['sections'][next(
+                    sid for sid, s in state['sections'].items() if s['source'] and s['source']['start'] == section['start'] and
+                    s['source']['source_path'] == section['path'])]['headings'][-1])
+        pairs = {r['group_id']: r for r in records if r['variant'] == 'original'}
+        for record in records:
+            if record['variant'] == 'paraphrase':
+                self.assertEqual(record['relevant'], pairs[record['group_id']]['relevant'])
+                self.assertNotEqual(record['query'], pairs[record['group_id']]['query'])
+        benchmark(state, self.root / 'again')
+        self.assertEqual((self.root / 'again/queries.jsonl').read_bytes(), (self.root / 'bench/queries.jsonl').read_bytes())
+        with self.assertRaisesRegex(ValueError, 'must be empty'):
+            benchmark(state, self.root / 'bench')
+
+    def test_benchmark_approved_only_exports_human_approved_questions(self):
+        run(self.store, self.provider.config)
+        state = self.store.load()
+        with self.assertRaisesRegex(ValueError, 'No human-approved'):
+            benchmark(state, self.root / 'none', approved_only=True)
+        approved = accepted(state)[0]
+        approved['human_status'] = 'approved'
+        accepted(state)[1]['human_status'] = 'rejected'
+        counts = benchmark(state, self.root / 'bench', approved_only=True)
+        records = [json.loads(line) for line in (self.root / 'bench/queries.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(counts['questions'], 1)
+        self.assertEqual({r['group_id'] for r in records}, {'q-' + approved['id'][:16]})
+        manifest = json.loads((self.root / 'bench/manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['selection'], 'human_approved')
+        self.assertEqual(set(manifest['docs']['source_files']),
+                         {path for r in records for path in r['documents']} | {s['path'] for r in records for s in r['sections']})
+
+    def test_rejected_paraphrase_keeps_its_question(self):
+        self.provider.paraphrase_ok = False
+        result = run(self.store, self.provider.config)
+        self.assertGreater(result['accepted'], 0)
+        state = self.store.load()
+        self.assertTrue(all(c['paraphrase_status'] == 'rejected' for c in accepted(state)))
+        self.assertEqual(benchmark(state, self.root / 'bench')['by_variant'], {'original': result['accepted']})
+
+    def test_existing_questions_get_paraphrases_without_browsing(self):
+        run(self.store, self.provider.config)
+        state = self.store.load()
+        for c in state['candidates']:
+            c.pop('paraphrase', None)
+            c.pop('paraphrase_status', None)
+        self.store.save(state)
+        calls = len(self.provider.calls)
+        result = paraphrase_existing(self.store, self.provider.config)
+        self.assertEqual(result['paraphrases'], {'accepted': len(accepted(state))})
+        self.assertEqual(len(self.provider.calls) - calls, 2 * len(accepted(state)))
+        self.assertTrue(all(c['paraphrase'].startswith('Put differently, ') for c in accepted(self.store.load())))
+        calls = len(self.provider.calls)
+        paraphrase_existing(self.store, self.provider.config)
+        self.assertEqual(len(self.provider.calls), calls)
 
     def test_generator_never_receives_source_or_inventory_prose(self):
         result = run(self.store, self.provider.config)

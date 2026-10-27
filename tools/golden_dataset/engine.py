@@ -4,11 +4,11 @@ from playwright.sync_api import Error as BrowserError
 
 from .browser import Browser
 from .model import Client, InvalidOutput, Paused
-from .reporting import browsing_complete, covered_sections, report
+from .reporting import accepted, browsing_complete, covered_sections, report
 from .snapshot import verify_snapshot
 from .storage import now
 from .tracing import trace, traced
-from .validation import PERSONAS, create_candidate, review_candidate
+from .validation import PERSONAS, add_paraphrase, create_candidate, review_candidate
 
 TOOL_TASK = '''You are a documentation user browsing a documentation web app in a real browser. You visit every page
 the way a reader would and collect the questions real users ask, building a golden question set for evaluating retrieval.
@@ -43,8 +43,11 @@ How to work:
 2. Then move on like a reader: follow a relevant article link, open menu groups, or use next_page() when nothing
    specific stands out. Do not reopen pages marked visited.
 3. A cross_page question combines necessary facts from different pages still in memory.
+4. Keep the set varied: besides factual questions, ask troubleshooting questions where a page covers errors or
+   limits, and cross_page questions whenever related pages are in memory.
 
-Each question: {"question":"...","reference_answer":"...","required_facts":["..."],
+Each question: {"question":"...","paraphrase":"the same question as a user who has not read the page would ask it,
+avoiding its distinctive wording","reference_answer":"...","required_facts":["..."],
 "persona":"new_developer|application_engineer|platform_operator","question_type":"factual|procedural|troubleshooting|cross_page",
 "difficulty":"easy|medium|hard","evidence_groups":[{"fact_indices":[0],"alternatives":[{"observation_id":"...",
 "excerpt":"exact substring copied from that observation's text"}]}],"related_links":[]}
@@ -246,3 +249,29 @@ def run(store, config, max_sections=None, retry_gaps=False):
         checkpoint()
         trace('checkpoint', f'Saved; status={state["runtime"]["status"]}')
         return report(state)
+
+
+def paraphrase_existing(store, config):
+    """Fill in paraphrases for accepted questions drafted before paraphrases existed; no browsing."""
+    with store.writer():
+        state = store.load()
+        verify_snapshot(state)
+        checkpoint = lambda: store.save(state)
+        client = Client(config, state, checkpoint)
+        todo = [c for c in accepted(state) if not c.get('paraphrase_status')]
+        error = None
+        try:
+            for c in todo:
+                try:
+                    with traced('paraphrase', f'Paraphrasing candidate {c["id"]}'):
+                        add_paraphrase(c, client)
+                except InvalidOutput:
+                    c['paraphrase_status'] = 'invalid'
+                checkpoint()
+        except (Paused, KeyboardInterrupt, OSError) as exc:
+            error = str(exc) or 'Interrupted; run paraphrase again to continue.'
+            trace('paused', error)
+        checkpoint()
+        statuses = [c.get('paraphrase_status') for c in accepted(state)]
+        return {'runtime': {'status': 'paused' if error else 'complete', 'error': error},
+                'paraphrases': {status or 'missing': statuses.count(status) for status in set(statuses)}}

@@ -20,12 +20,12 @@ def decide(state, ident, action, notes="", edits=None):
         raise ValueError("Action must be approve, reject, or edit")
     if action == "approve" and candidate["status"] != "accepted":
         raise ValueError("Only automatically accepted records can be approved; revalidate edits first")
-    previous = copy.deepcopy({k: candidate.get(k) for k in ("question", "reference_answer", "required_facts", "evidence_groups")})
+    previous = copy.deepcopy({k: candidate.get(k) for k in ("question", "paraphrase", "reference_answer", "required_facts", "evidence_groups")})
     original_category = [candidate["product"], candidate["question_type"]]
     if action == "edit":
         if not isinstance(edits, dict) or not edits:
             raise ValueError("Edits must be a nonempty object")
-        allowed = {"question", "reference_answer", "required_facts", "evidence_groups", "difficulty", "question_type", "persona"}
+        allowed = {"question", "paraphrase", "reference_answer", "required_facts", "evidence_groups", "difficulty", "question_type", "persona"}
         if set(edits) - allowed:
             raise ValueError("Only question content and labels can be edited")
         candidate.update(edits)

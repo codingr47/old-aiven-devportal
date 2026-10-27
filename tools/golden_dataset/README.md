@@ -95,15 +95,41 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Stop review with Ctrl+C whe
 you want the terminal back. You only need a third terminal if you want to keep
 review open alongside generation; pause generation before saving review changes.
 
-Export the current candidates to a new directory:
+Export the retrieval benchmark, the dataset other projects consume:
 
 ```powershell
-venv/Scripts/python.exe -m tools.golden_dataset export --output _build/golden-export-v1
+venv/Scripts/python.exe -m tools.golden_dataset export --format benchmark --output _build/golden-benchmark-v1
 ```
 
-This candidate export is allowed before human auditing. For an evaluation-ready
-release, complete the [audit workflow](REFERENCE.md#audit-limits-and-export), then
-export with `--ready-only`.
+It writes only two files:
+
+- `queries.jsonl`: one query per line (`id`, `group_id`, `variant`, `query`) with the source
+  locations that answer it. `relevant` is a list of groups; every group must be retrieved, and
+  any one location in a group satisfies it. Each location is `{path, start, end, line_start,
+  line_end, text, exact}` in a `.rst`/`.md` (or included) file. `sections` and `documents` give
+  coarser targets, and `tags` carries `question_type`, `difficulty`, `persona`, and `product`.
+- `manifest.json`: the docs commit and a SHA-256 for every file the exported queries point into, counts, the format
+  description, and known limitations.
+
+Offsets and hashes use each file decoded as UTF-8 with LF line endings, so they hold for any
+checkout. Answers, facts, and browsing details are not exported; the benchmark holds no metrics.
+`export --output DIR` without `--format` still writes every internal record for debugging.
+
+Questions drafted from now on include a reviewed paraphrase, exported as a second query with
+`variant: "paraphrase"` and the same `relevant` locations. To add paraphrases to questions
+accepted earlier (no browsing; one generator and one reviewer call each):
+
+```powershell
+venv/Scripts/python.exe -m tools.golden_dataset paraphrase
+```
+
+To export only the questions you approved in `review`, add `--approved-only`. The manifest then
+records `selection: human_approved` instead of `model_accepted`, which includes every question the
+reviewer model accepted and you did not reject.
+
+Exports are allowed before human auditing (`release_status: candidate_incomplete`). For an
+evaluation-ready release, complete the [audit workflow](REFERENCE.md#audit-limits-and-export),
+then export with `--ready-only`.
 
 ## A few settings
 

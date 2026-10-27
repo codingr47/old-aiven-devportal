@@ -11,7 +11,7 @@ from .storage import now
 PERSONAS = ('new_developer', 'application_engineer', 'platform_operator')
 TYPES = ('factual', 'procedural', 'troubleshooting', 'cross_page')
 DIFFICULTIES = ('easy', 'medium', 'hard')
-PROMPT_VERSION = 'golden-browser-v3'
+PROMPT_VERSION = 'golden-browser-v4'
 RUBRIC = ('answerable', 'supported', 'facts_complete', 'unambiguous', 'realistic', 'evidence_necessary')
 
 
@@ -112,7 +112,7 @@ def validate(candidate, state, require_read=True, check_duplicates=True):
 def create_candidate(raw, state, section_id, config):
     if section_id not in state['sections']:
         raise ValueError('Unknown observed target section')
-    keys = ('question', 'reference_answer', 'required_facts', 'persona', 'question_type', 'difficulty', 'evidence_groups', 'related_links')
+    keys = ('question', 'paraphrase', 'reference_answer', 'required_facts', 'persona', 'question_type', 'difficulty', 'evidence_groups', 'related_links')
     record = {key: raw.get(key) for key in keys}
     page = state['sections'][section_id]['page']
     parts = page.split('/')
@@ -148,15 +148,47 @@ def review_candidate(candidate, state, client):
     if errors:
         candidate['status'] = 'rejected'
         return False
+    paraphrase = candidate.get('paraphrase') if valid_paraphrase(candidate, candidate.get('paraphrase')) else None
+    fields = ('question', 'reference_answer', 'required_facts', 'question_type', 'evidence_groups') + (('paraphrase',) if paraphrase else ())
     result = client.ask('reviewer', 'Independently assess the standalone English question, reference answer, and required facts. '
                         'Check support in BOTH consumed browser observations and verified raw source_spans, fact completeness, '
                         'ambiguity, realism, and necessity of every evidence group. Each alternative independently supports its indexed facts. '
-                        'Return {"checks":{' + ','.join('"' + key + '":true' for key in RUBRIC) + '},"notes":"brief justification"}.',
-                        {'candidate': {k: candidate[k] for k in ('question', 'reference_answer', 'required_facts', 'question_type', 'evidence_groups')},
+                        + (PARAPHRASE_CHECK + ' ' if paraphrase else '') +
+                        'Return {"checks":{' + ','.join('"' + key + '":true' for key in RUBRIC + (('paraphrase_equivalent',) if paraphrase else ())) +
+                        '},"notes":"brief justification"}.',
+                        {'candidate': {k: candidate[k] for k in fields},
                          'browser_evidence': [{'observation_id': e['observation_id'], 'text': e['excerpt']}
                                               for group in candidate['evidence_groups'] for e in group['alternatives']]})
     checks = result.get('checks')
     passed = isinstance(checks, dict) and all(checks.get(key) is True for key in RUBRIC)
     candidate['validation']['model_review'] = result
+    # A failed paraphrase never rejects its question; only the paraphrase is withheld from export.
+    candidate['paraphrase_status'] = (None if not paraphrase else
+                                      'accepted' if isinstance(checks, dict) and checks.get('paraphrase_equivalent') is True else 'rejected')
     candidate.update(status='accepted' if passed else 'rejected', verification_stage='reviewed')
     return passed
+
+
+PARAPHRASE_CHECK = ('Also judge the paraphrase: paraphrase_equivalent is true only if it asks for the same information '
+                    'as the question and the same evidence fully answers it.')
+PARAPHRASE_TASK = ('Rewrite the question the way a user who has not read this page would ask it. Keep the meaning, so the '
+                   'same evidence fully answers it, but avoid the distinctive wording of the page where a user would naturally '
+                   'phrase it differently. Return {"paraphrase":"..."}.')
+
+
+def valid_paraphrase(candidate, paraphrase):
+    return (isinstance(paraphrase, str) and bool(paraphrase.strip()) and
+            question_key(paraphrase) != question_key(candidate.get('question')))
+
+
+def add_paraphrase(candidate, client):
+    """Paraphrase a question accepted before paraphrases existed: one generator and one reviewer call."""
+    evidence = [e['excerpt'] for group in candidate['evidence_groups'] for e in group['alternatives']]
+    paraphrase = client.ask('generator', PARAPHRASE_TASK, {'question': candidate['question'], 'evidence': evidence}).get('paraphrase')
+    if not valid_paraphrase(candidate, paraphrase):
+        candidate['paraphrase_status'] = 'invalid'
+        return
+    result = client.ask('reviewer', PARAPHRASE_CHECK + ' Return {"paraphrase_equivalent":true|false}.',
+                        {'question': candidate['question'], 'paraphrase': paraphrase, 'evidence': evidence})
+    candidate['paraphrase'] = paraphrase
+    candidate['paraphrase_status'] = 'accepted' if result.get('paraphrase_equivalent') is True else 'rejected'
