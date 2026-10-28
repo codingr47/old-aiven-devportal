@@ -3,6 +3,7 @@
 Use the documentation server you already run with `make livehtml`. The agent
 opens Chromium, browses that app, and generates questions from browser accessibility
 observations. Source files are checked afterward to attach exact citations.
+For how the agent and its modules work, see [the architecture](ARCHITECTURE.md).
 
 Run all commands from the repository root. Use the same Python environment as the
 documentation project; the commands below use its `venv` directly.
@@ -164,4 +165,5 @@ Old schema 1.0/2.0/3.0 checkpoints require a fresh run. If the build is missing,
 `make livehtml` and wait for its first build to finish.
 
 See [the reference](REFERENCE.md) for scope filters, browser behavior, evidence
-format, coverage metrics, auditing, and tests.
+format, coverage metrics, auditing, and tests, and [the architecture](ARCHITECTURE.md)
+for how the agent loop, verification, and modules fit together.
